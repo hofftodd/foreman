@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 from sqlmodel import col, select
 
-from foreman import gitops, images, sandbox
+from foreman import gitops, images, sandbox, testresults
 from foreman.config import get_settings
 from foreman.core import gates, watchdog
 from foreman.core.models import (
@@ -35,6 +37,8 @@ from foreman.core.models import (
 from foreman.core.state import emit, estop_active, github_token, stop_requested
 from foreman.db import session
 from foreman.sandbox import Runtime, StepSpec, kill_handle
+
+ACCEPTANCE_RUNNER = "tests/acceptance/run.sh"
 
 log = logging.getLogger("foreman.milestone")
 
@@ -64,11 +68,32 @@ def ready_for_acceptance(project: Project) -> bool:
     return project.acceptance_commit != gitops.head_commit(project.id)
 
 
+def acceptance_command(project: Project) -> str:
+    """The definition of done: the project's acceptance command, else the Tester's
+    acceptance runner, else the project test command."""
+    if project.acceptance_cmd:
+        return project.acceptance_cmd
+    assert project.id is not None
+    if (gitops.repo_dir(project.id) / ACCEPTANCE_RUNNER).is_file():
+        return f"sh {ACCEPTANCE_RUNNER}"
+    return project.test_cmd
+
+
+def _store(project: Project, head: str, results: Path, clone: Path) -> None:
+    """Record the acceptance results, when the runner wrote any."""
+    from foreman.orchestrator.runner import store_results
+
+    res = testresults.collect(results, clone)
+    if res.cases:
+        assert project.id is not None
+        store_results(project.id, None, None, "acceptance", head, res)
+
+
 async def run_acceptance(project_id: int, runtime: Runtime) -> None:
     with session() as s:
         project = s.get(Project, project_id)
         assert project is not None
-    cmd = project.acceptance_cmd or project.test_cmd
+    cmd = acceptance_command(project)
     head = gitops.head_commit(project_id)
     started = time.time()
     if not cmd:
@@ -81,6 +106,9 @@ async def run_acceptance(project_id: int, runtime: Runtime) -> None:
     )
     ctl = get_settings().runs_dir / f"acceptance-{project_id}"
     ctl.mkdir(parents=True, exist_ok=True)
+    results = ctl / "results"
+    shutil.rmtree(results, ignore_errors=True)
+    results.mkdir()
     image = ""
     if runtime.name == "docker":
         try:
@@ -102,8 +130,9 @@ async def run_acceptance(project_id: int, runtime: Runtime) -> None:
         ctl_dir=ctl,
         command=["bash", "-lc", cmd],
         labels={"foreman.project": str(project_id), "foreman.acceptance": "1"},
-        image=image,
         network=project.network,
+        image=image,
+        results_dir=results,
     )
     if runtime.name == "docker" and project.network != "open":
         try:
@@ -137,6 +166,7 @@ async def run_acceptance(project_id: int, runtime: Runtime) -> None:
         return
     output = "\n".join(tail)
     emit(project_id, None, "test", output[-4000:] or "(no output)", step="acceptance")
+    _store(project, head, results, clone)
     if code == 0:
         _record(project_id, head, True)
         emit(project_id, None, "test", "acceptance passed", step="acceptance", passed=True)

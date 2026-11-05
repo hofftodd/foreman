@@ -6,7 +6,16 @@ import type { Node } from "../types";
 
 export default function NodesPage() {
   const { data: nodes, error, reload } = usePoll<Node[]>("/api/nodes", 5000);
-  const empty = { name: "", provider: "openai", base_url: "", api_key: "", capacity: 1, context_window: 32768 };
+  const empty = {
+    name: "",
+    provider: "openai",
+    base_url: "",
+    api_key: "",
+    capacity: 1,
+    context_window: 32768,
+    price_in: 0,
+    price_out: 0,
+  };
   const [f, setF] = useState(empty);
   const [formError, setFormError] = useState("");
   const [checkErrors, setCheckErrors] = useState<Record<number, string>>({});
@@ -17,8 +26,8 @@ export default function NodesPage() {
         <h1>Inference nodes</h1>
       </div>
       <p className="muted">
-        OpenAI-compatible endpoints (llama.cpp server, LM Studio, Ollama, MLX, vLLM…). Executors in containers reach
-        the host's own services at <code>host.docker.internal</code>.
+        Local OpenAI-compatible servers (llama.cpp, LM Studio, Ollama, MLX, vLLM…) or the Claude API. Foreman connects
+        to them from this machine; agents reach them only through its gateway, which holds the API keys.
       </p>
       <ErrorNote error={error} />
       <div className="cards">
@@ -32,10 +41,16 @@ export default function NodesPage() {
             </div>
             <div className="mono small">{n.base_url}</div>
             <div className="small muted">
-              {n.provider === "anthropic" ? "Claude API (planner only)" : "OpenAI-compatible"} · capacity {n.capacity} ·{" "}
+              {n.provider === "anthropic" ? "Claude API" : "OpenAI-compatible"} · capacity {n.capacity} ·{" "}
               {n.context_window.toLocaleString()} ctx · checked {fmtTime(n.last_checked)}{" "}
               {n.has_api_key && "· api key set"}
             </div>
+            <NodeLoad n={n} />
+            {(n.price_in > 0 || n.price_out > 0) && (
+              <div className="small">
+                ${n.price_in.toFixed(2)} / ${n.price_out.toFixed(2)} per million tokens in / out
+              </div>
+            )}
             <div className="small">{n.models.length ? n.models.join(", ") : <span className="muted">no models listed</span>}</div>
             <ErrorNote error={checkErrors[n.id] ?? ""} />
             <CapacityEditor node={n} onSaved={reload} />
@@ -76,7 +91,7 @@ export default function NodesPage() {
           <Field label="Name">
             <input required value={f.name} placeholder="mac-studio" onChange={(e) => setF({ ...f, name: e.target.value })} />
           </Field>
-          <Field label="Provider" hint="Claude can be a planner; executors must be local/OpenAI-compatible">
+          <Field label="Provider" hint="Either can serve any role; Claude works with the OpenCode executor">
             <select
               value={f.provider}
               onChange={(e) =>
@@ -101,13 +116,36 @@ export default function NodesPage() {
           <Field label="API key" hint="Optional">
             <input type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} />
           </Field>
-          <Field label="Capacity" hint="Concurrent tasks this node can serve">
+          <Field label="Capacity" hint="Concurrent tasks and planner calls this node can serve">
             <input type="number" min={1} value={f.capacity} onChange={(e) => setF({ ...f, capacity: Number(e.target.value) })} />
+          </Field>
+          <Field label="Price in (USD / million tokens)" hint="0 for local nodes; priced nodes count against spend caps">
+            <input type="number" min={0} step="any" value={f.price_in} onChange={(e) => setF({ ...f, price_in: Number(e.target.value) })} />
+          </Field>
+          <Field label="Price out (USD / million tokens)">
+            <input type="number" min={0} step="any" value={f.price_out} onChange={(e) => setF({ ...f, price_out: Number(e.target.value) })} />
           </Field>
         </div>
         <ErrorNote error={formError} />
         <button className="btn primary">Add node</button>
       </form>
+    </div>
+  );
+}
+
+function NodeLoad({ n }: { n: Node }) {
+  const pct = Math.min(100, (n.active / n.capacity) * 100);
+  return (
+    <div className="node-load">
+      <div className="meter-label">
+        <span>
+          {n.active} of {n.capacity} slot{n.capacity === 1 ? "" : "s"} busy
+        </span>
+        <span className="muted">{n.waiting ? `${n.waiting} waiting` : "nothing waiting"}</span>
+      </div>
+      <div className="meter-bar">
+        <div className={`meter-fill ${pct >= 100 ? "warm" : ""}`} style={{ width: `${pct}%` }} />
+      </div>
     </div>
   );
 }

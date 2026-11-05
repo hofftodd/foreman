@@ -27,12 +27,17 @@ def make_project(client: Any, origin: Any, **kw: Any) -> dict[str, Any]:
 def make_task(
     client: Any, project_id: int, script: str, validation: str = "true", **kw: Any
 ) -> dict[str, Any]:
-    body = {
-        "title": kw.pop("title", "t"),
-        "executor_script": script,
-        "validation_cmd": validation,
-        **kw,
-    }
+    """A scripted (shell) task; for agent projects, an agent task with criteria instead
+    (agents' tests come from the Tester, not a command)."""
+    kind = kw.get("executor_kind") or client.get(f"/api/projects/{project_id}").json().get(
+        "executor_kind"
+    )
+    body: dict[str, Any] = {"title": kw.pop("title", "t"), **kw}
+    if kind == "shell":
+        body |= {"executor_script": script, "validation_cmd": validation}
+    else:
+        body.setdefault("criteria", ["it works"])
+        body.pop("allowed_globs", None)
     r = client.post(f"/api/projects/{project_id}/tasks", json=body)
     assert r.status_code == 201, r.text
     return r.json()

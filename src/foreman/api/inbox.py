@@ -18,6 +18,8 @@ router = APIRouter()
 class Decision(BaseModel):
     approve: bool
     note: str = ""
+    # For a blocked task: "send_back" asks the Tester to write its tests again.
+    action: str = ""
 
 
 def _out(g: Gate, names: dict[int, str], titles: dict[int, str]) -> dict[str, Any]:
@@ -49,7 +51,9 @@ def list_gates(project_id: int | None = None, state: str = "pending") -> list[di
 
 @router.post("/api/gates/{gate_id}/resolve")
 def resolve_gate(gate_id: int, body: Decision) -> Gate:
-    gate = gates.resolve(gate_id, body.approve, body.note)
+    if body.action and body.action != "send_back":
+        raise HTTPException(400, f"unknown action {body.action!r}")
+    gate = gates.resolve(gate_id, body.approve, body.note, action=body.action)
     if gate is None:
         raise HTTPException(409, "this checkpoint is not waiting for a decision")
     return gate

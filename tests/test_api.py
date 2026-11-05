@@ -23,9 +23,9 @@ def test_clone_failure_is_reported(client, tmp_path):
 
 
 def test_task_requires_validation_and_valid_deps(client, origin):
-    p = make_project(client, origin)
+    p = make_project(client, origin)  # scripted (shell) tasks: they need a check command
     r = client.post(f"/api/projects/{p['id']}/tasks", json={"title": "x"})
-    assert r.status_code == 422
+    assert r.status_code == 400 and "validation command" in r.json()["detail"]
     r = client.post(
         f"/api/projects/{p['id']}/tasks",
         json={"title": "x", "validation_cmd": "true", "deps": [999]},

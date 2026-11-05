@@ -48,8 +48,14 @@ TRANSITIONS: dict[TaskState, set[TaskState]] = {
         TaskState.PAUSED,
         TaskState.STOPPED_BY_USER,
         TaskState.AWAITING_MERGE,
+        TaskState.QUEUED,  # coverage too low: back to the Tester
     },
-    TaskState.AWAITING_MERGE: {TaskState.DONE, TaskState.FAILED, TaskState.STOPPED_BY_USER},
+    TaskState.AWAITING_MERGE: {
+        TaskState.DONE,
+        TaskState.FAILED,
+        TaskState.STOPPED_BY_USER,
+        TaskState.QUEUED,  # coverage checkpoint rejected: back to the Tester
+    },
     TaskState.FAILED: {
         TaskState.QUEUED,
         TaskState.DISCARDED,

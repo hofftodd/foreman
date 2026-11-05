@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from sqlmodel import col, select
 
-from foreman.core import gates, watchdog
+from foreman.core import gates, roles, watchdog
 from foreman.core.models import (
     GateKind,
     JobKind,
@@ -75,7 +75,7 @@ def decide(project: Project, task: Task, run: TaskRun) -> Decision:
         watchdog.limit(project, "split")
         and task.escalation_level < LEVEL_SPLIT
         and split_depth(task) < MAX_SPLIT_DEPTH
-        and bool(((project.role_bindings or {}).get("planner") or {}).get("node_id"))
+        and bool(roles.binding(project, roles.TASK_PLANNER))
     )
 
     if run.failure_kind == "config":
@@ -106,6 +106,12 @@ def after_failure(task_id: int, run_id: int) -> Decision | None:
             return None
         project = s.get(Project, task.project_id)
         assert project is not None
+        if run.failure_kind == "budget":
+            # Not the task's fault: it runs again once the spend cap is raised.
+            d = Decision("retry", "waiting for the spend cap to be raised")
+            emit(project.id, task_id, "watchdog", f"escalation: retry ({d.reason})", action="retry")
+            transition(task_id, (TaskState.FAILED,), TaskState.QUEUED, d.reason)
+            return d
         if not watchdog.limit(project, "escalation"):
             return None
         task.level_failures += 1

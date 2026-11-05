@@ -297,3 +297,153 @@ def build_prompt(project: Project, task: Task, previous_failure: str = "") -> st
     return build_pack(
         project, task, Path("/nonexistent"), spec="", previous_failure=previous_failure
     ).text
+
+
+# -- role packs (Tester / Builder) ----------------------------------------------------
+
+RESULTS_CONTRACT = [
+    "## How tests run",
+    "`tests/run.sh` runs the whole test suite. It must exit non-zero when any test fails "
+    "and write, into the directory `$FOREMAN_RESULTS`:",
+    "- `junit.xml`: the results in JUnit XML (e.g. pytest `--junitxml`, jest-junit, gotestsum);",
+    "- `coverage.xml` (Cobertura) or `lcov.info`: line coverage of the project's code.",
+    "There is no internet access: use only what the toolchain image provides.",
+    "",
+]
+
+KIND_NOTES = {
+    "tester": {
+        "setup": [
+            "## This task: project setup",
+            "Create `tests/run.sh` following the contract below (pick the project's test "
+            "framework and coverage tool from the design), and a first smoke test that "
+            "checks the project's entry point exists. The Builder sets up the toolchain "
+            "and skeleton afterwards to make it pass.",
+            "",
+        ],
+        "acceptance": [
+            "## This task: acceptance tests",
+            "Turn every acceptance criterion below into executable tests under "
+            "`tests/acceptance/`, and write `tests/acceptance/run.sh`, which runs only those "
+            "tests and follows the same results contract. They are the definition of done "
+            "for the whole project, so they will fail until the work is finished.",
+            "",
+        ],
+        "docs": [
+            "## This task: documentation",
+            "Write tests that check README.md says what the project is, how to run it and "
+            "how to test it (with run and test commands that work), and that "
+            "ARCHITECTURE.md describes how the project is organised.",
+            "",
+        ],
+    },
+    "builder": {
+        "setup": [
+            "## This task: project setup",
+            "Write `.foreman/Dockerfile` (FROM foreman/executor-base) installing the "
+            "language toolchain, test framework and coverage tool the tests need, the "
+            "project skeleton, a README.md (what the project is, how to run it, how to "
+            "test it) and an ARCHITECTURE.md (how the project is organised, following the "
+            "design).",
+            "",
+        ],
+        "docs": [
+            "## This task: documentation",
+            "Bring README.md and ARCHITECTURE.md up to date with what has been built.",
+            "",
+        ],
+    },
+}
+
+
+def _doc(repo: Path, rel: str | None, limit: int = 120) -> str:
+    if not rel:
+        return ""
+    text = _read(repo, rel).strip()
+    lines = text.splitlines()
+    more = f"\n... ({len(lines) - limit} more lines)" if len(lines) > limit else ""
+    return "\n".join(lines[:limit]) + more
+
+
+def build_role_pack(
+    project: Project,
+    task: Task,
+    repo: Path,
+    role: str,
+    *,
+    docs: dict[str, str],
+    test_paths: list[str],
+    task_tests: list[str] | None = None,
+    base_image: str = "",
+    context_window: int | None = None,
+    previous_failure: str = "",
+) -> ContextPack:
+    """The briefing for the Tester or the Builder on one task.
+
+    `docs` maps planning-document keys (requirements, design, acceptance) to their
+    repo paths; `task_tests` are the files the Tester wrote for this task (shown to
+    the Builder in full)."""
+    files = repo_files(repo) if (repo / ".git").exists() else []
+    test_dirs = ", ".join(f"`{d}/`" for d in test_paths)
+    lines = [f"# Task {task.key or task.id}: {task.title}", ""]
+    if role == "tester":
+        lines += [
+            "You are the Tester Agent. Write the tests for this task: they define when it is "
+            "done, and should fail until the Builder Agent implements it. Then run them.",
+            f"You may only create or change files under {test_dirs}. Everything else is "
+            "read-only: changes there are rejected.",
+            "",
+        ]
+    else:
+        lines += [
+            "You are the Builder Agent. Write the code that makes this task's tests pass, "
+            "without breaking the rest of the test suite.",
+            f"You may change any file except the tests ({test_dirs}), which are read-only: "
+            "you can run them but not edit them.",
+            "",
+        ]
+    lines += KIND_NOTES.get(role, {}).get(task.kind, [])
+    if task.description:
+        lines += ["## Goal", task.description.strip(), ""]
+    if task.criteria:
+        lines += ["## Done when", *[f"- {c}" for c in task.criteria], ""]
+    missing: list[str] = []
+    if task.req_refs:
+        requirements = _read(repo, docs.get("requirements", ""))
+        slice_text, missing = requirement_slice(requirements, task.req_refs)
+        if slice_text:
+            lines += ["## Requirements", slice_text, ""]
+    if task.kind == "acceptance" and role == "tester":
+        criteria = _doc(repo, docs.get("acceptance"), limit=400)
+        if criteria:
+            lines += ["## Acceptance criteria (the whole project)", criteria, ""]
+    design = _doc(repo, docs.get("design"))
+    if design:
+        lines += ["## Design (excerpt)", design, ""]
+    if role == "builder" and task_tests:
+        lines += ["## The tests for this task (read-only)", ""]
+        for rel in task_tests:
+            source = _read(repo, rel)
+            if source:
+                lines += [f"`{rel}`:", _fence(rel), _clip(source), "```", ""]
+    if role == "builder" and task.kind == "setup" and base_image:
+        lines += ["## Toolchain image", base_image, ""]
+    lines += RESULTS_CONTRACT
+    lines += ["Run the suite with `sh tests/run.sh`.", ""]
+    if files:
+        shown = files[:200]
+        lines += ["## Repository files", *shown]
+        if len(files) > len(shown):
+            lines.append(f"... and {len(files) - len(shown)} more")
+        lines.append("")
+    if previous_failure:
+        lines += ["## Previous attempt failed", previous_failure.strip(), ""]
+    lines += ["Do not commit; the orchestrator commits your changes."]
+    text = "\n".join(lines) + "\n"
+    return ContextPack(
+        text=text,
+        tokens=estimate_tokens(text),
+        budget=budget_tokens(project, context_window, task.executor_kind or None),
+        files=task_tests or [],
+        missing_refs=missing,
+    )

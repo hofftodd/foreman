@@ -13,6 +13,10 @@ from typing import Protocol
 
 from foreman.core.models import Project, Task
 
+# Exit status an executor's command uses for "this can't work as configured"
+# (e.g. its tool isn't installed): the task blocks instead of being retried.
+EXIT_CONFIG = 78
+
 
 @dataclass(frozen=True)
 class ExecutorContext:
@@ -49,6 +53,8 @@ class Executor(Protocol):
     # Tokens the agent itself puts in every model request (system prompt, tool schemas),
     # measured through the gateway. Comes off the window before the context budget.
     prompt_overhead_tokens: int
+    # Node providers whose API the executor's tool can speak (through the gateway).
+    providers: frozenset[str]
 
     def prepare(
         self,
@@ -59,7 +65,12 @@ class Executor(Protocol):
         ctl_dir: Path,
         prompt: str,
         context: ExecutorContext | None = None,
+        provider: str = "openai",
+        role: str = "",
     ) -> ExecutorInvocation:
-        """`endpoint` is the OpenAI-compatible base URL the executor must use (the
-        run's model gateway URL); it carries no credentials."""
+        """`endpoint` is the base URL the executor must use (the run's model gateway
+        URL, ending in /v1); it carries no credentials. `provider` says which API it
+        speaks: "openai" (chat completions) or "anthropic" (Claude Messages). `role` is
+        the agent being run ("tester" / "builder"; "" for a single-step scripted task).
+        `context` describes the model's window and output limit."""
         ...

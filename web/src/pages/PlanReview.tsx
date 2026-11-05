@@ -4,15 +4,15 @@ import { ActionButton, ErrorNote, Field, lines } from "../components";
 import { usePoll } from "../hooks";
 import type { Project, Task } from "../types";
 
+const KIND_LABEL: Record<Task["kind"], string> = {
+  setup: "standard task: setup",
+  acceptance: "standard task: acceptance tests",
+  feature: "",
+  docs: "standard task: documentation",
+};
+
 function TaskEditor({ t, onSaved }: { t: Task; onSaved: () => void }) {
-  const [f, setF] = useState({
-    title: t.title,
-    description: t.description,
-    todos: t.todos.join("\n"),
-    allowed_globs: t.allowed_globs.join("\n"),
-    context_files: t.context_files.join("\n"),
-    validation_cmd: t.validation_cmd,
-  });
+  const [f, setF] = useState({ title: t.title, description: t.description, criteria: t.criteria.join("\n") });
   const [error, setError] = useState("");
   const set = (k: string, v: string) => setF((x) => ({ ...x, [k]: v }));
   return (
@@ -24,10 +24,7 @@ function TaskEditor({ t, onSaved }: { t: Task; onSaved: () => void }) {
           await patch(`/api/tasks/${t.id}`, {
             title: f.title,
             description: f.description,
-            todos: lines(f.todos),
-            allowed_globs: lines(f.allowed_globs),
-            context_files: lines(f.context_files),
-            validation_cmd: f.validation_cmd,
+            criteria: lines(f.criteria),
           });
           onSaved();
         } catch (err) {
@@ -39,20 +36,11 @@ function TaskEditor({ t, onSaved }: { t: Task; onSaved: () => void }) {
         <Field label="Title">
           <input value={f.title} onChange={(e) => set("title", e.target.value)} />
         </Field>
-        <Field label="Done when">
-          <input className="mono" value={f.validation_cmd} onChange={(e) => set("validation_cmd", e.target.value)} />
-        </Field>
-        <Field label="Description">
+        <Field label="Goal">
           <textarea rows={3} value={f.description} onChange={(e) => set("description", e.target.value)} />
         </Field>
-        <Field label="Todos" hint="One per line">
-          <textarea rows={3} value={f.todos} onChange={(e) => set("todos", e.target.value)} />
-        </Field>
-        <Field label="Files it may change" hint="One per line">
-          <textarea rows={3} className="mono" value={f.allowed_globs} onChange={(e) => set("allowed_globs", e.target.value)} />
-        </Field>
-        <Field label="Interfaces it uses" hint="Read-only files, one per line">
-          <textarea rows={3} className="mono" value={f.context_files} onChange={(e) => set("context_files", e.target.value)} />
+        <Field label="Done when" hint="Plain-language criteria, one per line; the Tester turns them into tests">
+          <textarea rows={4} value={f.criteria} onChange={(e) => set("criteria", e.target.value)} />
         </Field>
       </div>
       <ErrorNote error={error} />
@@ -69,10 +57,10 @@ function ProposedTask({ t, all, reload }: { t: Task; all: Task[]; reload: () => 
     <div className={`card proposed ${tooBig ? "too-big" : ""}`}>
       <div className="row">
         <h3>
-          <span className="muted">{t.key || `#${t.id}`}</span> {t.title}
+          <span className="muted">{t.key || `#${t.id}`}</span> {t.title}{" "}
+          {KIND_LABEL[t.kind] && <span className="badge kind-badge">{KIND_LABEL[t.kind]}</span>}
         </h3>
         <div className="actions">
-          <span className="small muted">~{t.pack_tokens.toLocaleString()} tokens</span>
           <button className="btn" onClick={() => setEditing((x) => !x)}>
             {editing ? "Close" : "Edit"}
           </button>
@@ -89,7 +77,7 @@ function ProposedTask({ t, all, reload }: { t: Task; all: Task[]; reload: () => 
       </div>
       {tooBig && (
         <div className="error-note">
-          Too big for the executor: {t.size_violations.join("; ")}. Edit or split it.
+          Too big: {t.size_violations.join("; ")}. Edit or split it.
         </div>
       )}
       {editing ? (
@@ -103,6 +91,18 @@ function ProposedTask({ t, all, reload }: { t: Task; all: Task[]; reload: () => 
       ) : (
         <div className="proposed-body">
           {t.description && <p className="pre">{t.description}</p>}
+          {t.criteria.length > 0 && (
+            <>
+              <div className="small">
+                <b>Done when:</b>
+              </div>
+              <ul className="small criteria">
+                {t.criteria.map((c, i) => (
+                  <li key={i}>{c}</li>
+                ))}
+              </ul>
+            </>
+          )}
           <div className="small">
             {t.req_refs.length > 0 && (
               <div>
@@ -114,25 +114,7 @@ function ProposedTask({ t, all, reload }: { t: Task; all: Task[]; reload: () => 
                 <b>After:</b> {deps.join(", ")}
               </div>
             )}
-            <div>
-              <b>Changes:</b> <span className="mono">{t.allowed_globs.join(", ") || "—"}</span>
-            </div>
-            {t.context_files.length > 0 && (
-              <div>
-                <b>Uses:</b> <span className="mono">{t.context_files.join(", ")}</span>
-              </div>
-            )}
-            <div>
-              <b>Done when:</b> <code>{t.validation_cmd || "(missing)"}</code>
-            </div>
           </div>
-          {t.todos.length > 0 && (
-            <ul className="small">
-              {t.todos.map((x, i) => (
-                <li key={i}>{x}</li>
-              ))}
-            </ul>
-          )}
         </div>
       )}
     </div>
@@ -155,9 +137,9 @@ export default function PlanReview({ project, onChange }: { project: Project; on
         <div>
           <h2>Review the plan</h2>
           <p className="muted small">
-            The planner split the approved spec into {proposed.length} tasks, each sized to fit the executor model
-            (max {project.max_task_files} files, ≤{project.context_budget_pct}% of its context window). Nothing runs
-            until you approve.
+            The Task Planning Agent broke the approved documents into {proposed.length} tasks, in plain language. For
+            each one the Tester Agent writes the tests from its criteria, then the Builder Agent writes the code until
+            they pass. Nothing runs until you approve.
           </p>
         </div>
         <div className="actions">
@@ -167,7 +149,7 @@ export default function PlanReview({ project, onChange }: { project: Project; on
               refresh();
             }}
           >
-            Back to spec
+            Back to documents
           </ActionButton>
           <ActionButton
             onClick={async () => {
@@ -197,7 +179,7 @@ export default function PlanReview({ project, onChange }: { project: Project; on
       <ErrorNote error={error} />
       {blocked.length > 0 && (
         <div className="error-note">
-          {blocked.length} task(s) are too big for the executor. Edit them, drop them, or re-run the breakdown.
+          {blocked.length} task(s) are too big. Edit them, drop them, or re-run the breakdown.
         </div>
       )}
       {proposed.map((t) => (

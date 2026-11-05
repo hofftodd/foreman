@@ -22,6 +22,7 @@ from sqlmodel import col, select
 
 from foreman import gitops
 from foreman.api.schemas import ChatMessage, DocUpdate
+from foreman.core import roles
 from foreman.core.contextpack import build_pack, repo_files, size_violations
 from foreman.core.models import (
     JobKind,
@@ -38,7 +39,7 @@ from foreman.core.models import (
 )
 from foreman.core.state import emit
 from foreman.db import session
-from foreman.planner import DOC_NAMES, doc_path
+from foreman.planner import DOC_NAMES, MAX_CRITERIA, doc_path
 
 router = APIRouter()
 
@@ -96,8 +97,22 @@ def recheck_task_size(task_id: int) -> None:
         assert t is not None
         p = s.get(Project, t.project_id)
         assert p is not None
-        binding = (p.role_bindings or {}).get("executor") or {}
+        binding = roles.binding(p, roles.BUILDER)
         node = s.get(Node, binding["node_id"]) if binding.get("node_id") else None
+    if not t.validation_cmd and not t.allowed_globs:
+        # A planned task (plain language): its size is its criteria.
+        problems = []
+        if not t.criteria:
+            problems.append("needs at least one acceptance criterion")
+        elif len(t.criteria) > MAX_CRITERIA:
+            problems.append(f"{len(t.criteria)} criteria (limit {MAX_CRITERIA}); split it")
+        with session() as s:
+            row = s.get(Task, task_id)
+            assert row is not None
+            row.size_violations = problems
+            s.add(row)
+            s.commit()
+        return
     repo = gitops.repo_dir(t.project_id)
     if not (repo / ".git").exists():
         return
@@ -175,8 +190,8 @@ def list_jobs(project_id: int) -> list[PlannerJob]:
 @router.put("/api/projects/{project_id}/spec/docs/{name}")
 async def put_doc(project_id: int, name: str, body: DocUpdate) -> dict[str, Any]:
     p = _project(project_id)
-    if name not in ("spec", "plan", "validation"):
-        raise HTTPException(400, "only spec, plan and validation can be edited")
+    if name not in roles.PLANNING_DOCS:
+        raise HTTPException(400, f"only {', '.join(roles.PLANNING_DOCS)} can be edited")
     if p.phase not in EDITABLE_PHASES:
         raise HTTPException(409, f"documents are frozen in phase {p.phase.value}")
     _require_idle(project_id)
@@ -184,9 +199,9 @@ async def put_doc(project_id: int, name: str, body: DocUpdate) -> dict[str, Any]
         gitops.write_and_commit,
         project_id,
         {doc_path(p, name): body.content},
-        f"spec: edit {name}.md",
+        f"spec: edit {doc_path(p, name).rsplit('/', 1)[-1]}",
     )
-    emit(project_id, None, "system", f"{name}.md edited by user", doc=name)
+    emit(project_id, None, "system", f"{doc_path(p, name)} edited by user", doc=name)
     return {"ok": True, "commit": sha}
 
 
@@ -214,13 +229,11 @@ def approve_spec(project_id: int) -> dict[str, Any]:
     _require_idle(project_id)
     missing = [
         n
-        for n in ("spec", "plan", "validation")
+        for n in roles.PLANNING_DOCS
         if not gitops.read_repo_file(project_id, doc_path(p, n)).strip()
     ]
     if missing:
         raise HTTPException(400, f"missing documents: {', '.join(missing)}")
-    if not p.acceptance_cmd.strip():
-        raise HTTPException(400, "set the acceptance command before approving")
     _set_phase(
         p,
         ProjectPhase.DECOMPOSING,

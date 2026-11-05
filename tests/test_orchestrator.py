@@ -173,7 +173,7 @@ async def test_opencode_without_node_fails_cleanly(client, origin):
     p = make_project(client, origin, executor_kind="opencode")
     t = make_task(client, p["id"], script="")
     await drive(Orchestrator(), lambda: task(t["id"]).state in TERMINAL)
-    assert "no executor node" in task(t["id"]).reason
+    assert "no node/model configured for the Tester Agent" in task(t["id"]).reason
 
 
 async def test_retry_keeps_partial_work_and_passes_failure_reason(client, origin):

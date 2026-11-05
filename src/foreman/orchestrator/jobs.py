@@ -1,4 +1,6 @@
-"""Planner jobs: Phase 1 chat turns and plan decomposition, run by the orchestrator.
+"""Planner jobs, run by the orchestrator: the Project Planning Agent's chat turns
+(JobKind.CHAT) and the Task Planning Agent's breakdown, splits and plan reviews
+(DECOMPOSE, SPLIT, REVIEW). See core/roles.py for what each may do.
 
 Jobs stream from the planner model and are stoppable mid-stream: Stop / E-stop
 on the project (or the supervisor marking the job stopped) closes the model
@@ -17,14 +19,8 @@ from sqlalchemy import delete, update
 from sqlmodel import col, select
 
 from foreman import gitops
-from foreman.core.contextpack import (
-    budget_tokens,
-    build_pack,
-    estimate_tokens,
-    matching_files,
-    repo_files,
-    size_violations,
-)
+from foreman.core import roles, spend
+from foreman.core.contextpack import estimate_tokens, repo_files
 from foreman.core.models import (
     JobKind,
     JobState,
@@ -43,6 +39,7 @@ from foreman.core.state import emit, stop_requested, transition
 from foreman.db import session
 from foreman.llm import Aborted, LLMError, stream_chat
 from foreman.planner import (
+    DOC_NAMES,
     PlanError,
     TaskSpec,
     chat_system_prompt,
@@ -53,6 +50,7 @@ from foreman.planner import (
     render_tasks_md,
     retry_message,
     split_system_prompt,
+    standard_tasks,
     topo_order,
 )
 
@@ -60,6 +58,7 @@ log = logging.getLogger("foreman.jobs")
 
 MAX_DECOMPOSE_ATTEMPTS = 3
 FLUSH_S = 0.25
+BUDGET_POLL_S = 2.0
 
 
 class JobFailed(Exception):
@@ -96,19 +95,12 @@ def planner_note(project_id: int, text: str, job_id: int | None = None) -> None:
 
 def read_docs(project: Project) -> dict[str, str]:
     assert project.id is not None
-    return {
-        name: gitops.read_repo_file(project.id, doc_path(project, name))
-        for name in ("spec", "plan", "validation", "tasks")
-    }
+    return {name: gitops.read_repo_file(project.id, doc_path(project, name)) for name in DOC_NAMES}
 
 
-def _binding(project: Project, role: str) -> tuple[Node | None, str]:
-    b = (project.role_bindings or {}).get(role) or {}
-    node = None
-    if b.get("node_id") is not None:
-        with session() as s:
-            node = s.get(Node, b["node_id"])
-    return node, b.get("model", "")
+def job_role(kind: JobKind) -> str:
+    """Which agent runs a planner job."""
+    return roles.PROJECT_PLANNER if kind == JobKind.CHAT else roles.TASK_PLANNER
 
 
 def _fit_history(messages: list[dict[str, str]], budget: int) -> list[dict[str, str]]:
@@ -190,9 +182,30 @@ class JobRunner:
                 s.add(job)
                 s.commit()
 
+    async def _wait_for_budget(self, node: Node) -> None:
+        """Paid calls wait while the project is at its spend cap."""
+        reason = spend.blocked(self.project_id, node)
+        if not reason:
+            return
+        emit(self.project_id, None, "system", f"planner waiting: {reason}", job_id=self.job_id)
+        while spend.blocked(self.project_id, node):
+            if self.should_abort():
+                raise Aborted()
+            await asyncio.sleep(BUDGET_POLL_S)
+
+    def _on_research(self, what: str) -> None:
+        self._flush()
+        emit(self.project_id, None, "research", what, job_id=self.job_id)
+
     async def _call(
-        self, node: Node, model: str, system: str, messages: list[dict[str, str]]
+        self,
+        node: Node,
+        model: str,
+        system: str,
+        messages: list[dict[str, str]],
+        research: bool = False,
     ) -> str:
+        await self._wait_for_budget(node)
         result = await stream_chat(
             node,
             model,
@@ -201,9 +214,12 @@ class JobRunner:
             on_text=self._on_text,
             on_reasoning=self._on_reasoning,
             should_abort=self.should_abort,
+            research=research,
+            on_research=self._on_research,
         )
         self._flush()
         self._record_usage(result.input_tokens, result.output_tokens)
+        spend.charge(self.project_id, node, result.input_tokens, result.output_tokens)
         if not result.text.strip():
             if result.truncated:
                 doing = "thinking " if result.reasoning_chars else ""
@@ -228,7 +244,7 @@ class JobRunner:
             s.commit()
         try:
             project = self.project()
-            node, model = _binding(project, "planner")
+            node, model = roles.node_and_model(project, job_role(self.kind))
             with session() as s:
                 job = s.get(PlannerJob, self.job_id)
                 assert job is not None
@@ -244,7 +260,8 @@ class JobRunner:
                 job_kind=self.kind.value,
             )
             if node is None or not model:
-                raise JobFailed("no planner node/model configured for this project")
+                role = roles.ROLES[job_role(self.kind)].name
+                raise JobFailed(f"no planner node/model configured for this project ({role})")
             if self.kind == JobKind.CHAT:
                 await self._chat(node, model)
             elif self.kind == JobKind.DECOMPOSE:
@@ -297,7 +314,7 @@ class JobRunner:
         project = self.project()
         docs = read_docs(project)
         tree = repo_files(gitops.repo_dir(self.project_id))
-        system = chat_system_prompt(project, docs, tree, project.acceptance_cmd)
+        system = chat_system_prompt(project, docs, tree)
         with session() as s:
             history = s.exec(
                 select(SpecMessage)
@@ -310,7 +327,8 @@ class JobRunner:
         if not messages or messages[-1]["role"] != "user":
             raise JobFailed("nothing to answer")
 
-        text = await self._call(node, model, system, messages)
+        # Only the Project Planning Agent may research on the web (core/roles.py).
+        text = await self._call(node, model, system, messages, research=True)
         out = parse_chat(project, text)
         if not finish_job(self.job_id, (JobState.RUNNING,), JobState.DONE):
             return  # stopped while we were finishing: apply nothing
@@ -319,16 +337,14 @@ class JobRunner:
             await asyncio.to_thread(
                 gitops.write_and_commit, self.project_id, out.files, f"spec: {first}"
             )
-        if out.acceptance_cmd is not None:
-            with session() as s:
-                p = s.get(Project, self.project_id)
-                assert p is not None
-                p.acceptance_cmd = out.acceptance_cmd
-                s.add(p)
-                s.commit()
+        for what in out.rejected:
+            roles.denied(self.project_id, None, roles.PROJECT_PLANNER, f"write {what}")
         content = out.message or "(updated files)"
         if out.rejected:
-            content += "\n\n(foreman refused writes to: " + ", ".join(out.rejected) + ")"
+            content += (
+                "\n\n(foreman refused: " + ", ".join(out.rejected) + ". The planner writes only "
+                "the planning documents.)"
+            )
         with session() as s:
             s.add(
                 SpecMessage(
@@ -343,109 +359,49 @@ class JobRunner:
 
     # -- decomposition ------------------------------------------------------
 
-    def _check_sizes(
-        self, project: Project, specs: list[TaskSpec], window: int | None
-    ) -> tuple[dict[str, list[str]], dict[str, int]]:
-        repo = gitops.repo_dir(self.project_id)
-        files = repo_files(repo)
-        spec_text = gitops.read_repo_file(self.project_id, doc_path(project, "spec"))
-        violations: dict[str, list[str]] = {}
-        tokens: dict[str, int] = {}
-        for t in specs:
-            task = Task(
-                project_id=self.project_id,
-                key=t.key,
-                title=t.title,
-                description=t.description,
-                todos=t.todos,
-                req_refs=t.req_refs,
-                allowed_globs=t.allowed_files,
-                context_files=t.context_files,
-                validation_cmd=t.validation_cmd,
-            )
-            pack = build_pack(project, task, repo, context_window=window, spec=spec_text)
-            tokens[t.key] = pack.tokens
-            v = size_violations(project, task, pack, files)
-            if any(any(c in g for c in "*?[") for g in t.allowed_files):
-                v.append("allowed_files must list files explicitly (no wildcards)")
-            if matching_files(t.allowed_files, [f"specs/{project.feature}/x.md"]):
-                v.append("tasks must not edit the spec documents")
-            if v:
-                violations[t.key] = v
-        return violations, tokens
-
-    def _executor_window(self, project: Project) -> int | None:
-        exec_node, _ = _binding(project, "executor")
-        return exec_node.context_window if exec_node else None
-
     async def _plan_loop(
         self,
         node: Node,
         model: str,
-        project: Project,
         system: str,
         first_message: str,
         what: str,
-    ) -> tuple[list[TaskSpec], dict[str, list[str]], dict[str, int]]:
-        """Ask for a task list until it parses and fits (or attempts run out).
-
-        Returns the last list that parsed, with any remaining size problems.
-        """
-        window = self._executor_window(project)
+    ) -> list[TaskSpec]:
+        """Ask for a task list until it parses and passes the checks (or attempts run out)."""
         messages = [{"role": "user", "content": first_message}]
-        best: tuple[list[TaskSpec], dict[str, list[str]], dict[str, int]] | None = None
         last_error = ""
         for attempt in range(1, MAX_DECOMPOSE_ATTEMPTS + 1):
             text = await self._call(node, model, system, messages)
             try:
-                specs = parse_tasks(text)
-                violations, tokens = await asyncio.to_thread(
-                    self._check_sizes, project, specs, window
-                )
-                best = (specs, violations, tokens)
-                problems = [f"task {k}: {'; '.join(v)}" for k, v in violations.items()]
+                return parse_tasks(text)
             except PlanError as e:
                 last_error = str(e)
-                problems = [last_error]
-            if not problems:
-                break
             emit(
                 self.project_id,
                 None,
                 "system",
-                f"{what} attempt {attempt}: {len(problems)} problem(s)",
-                problems=problems,
+                f"{what} attempt {attempt}: {last_error}",
+                problems=[last_error],
             )
             if attempt < MAX_DECOMPOSE_ATTEMPTS:
                 messages += [
                     {"role": "assistant", "content": text},
-                    {"role": "user", "content": retry_message(problems)},
+                    {"role": "user", "content": retry_message([last_error])},
                 ]
-        if best is None:
-            raise JobFailed(f"could not get a valid task list: {last_error}")
-        return best
+        raise JobFailed(f"could not get a valid task list: {last_error}")
 
     async def _decompose(self, node: Node, model: str) -> None:
         project = self.project()
-        docs = read_docs(project)
-        tree = repo_files(gitops.repo_dir(self.project_id))
-        budget = budget_tokens(project, self._executor_window(project))
-        system = decompose_system_prompt(project, docs, tree, budget)
-        specs, violations, tokens = await self._plan_loop(
-            node, model, project, system, "Break the plan into tasks now.", "task breakdown"
+        system = decompose_system_prompt(project, read_docs(project))
+        specs = await self._plan_loop(
+            node, model, system, "Break the plan into tasks now.", "task breakdown"
         )
         if not finish_job(self.job_id, (JobState.RUNNING,), JobState.DONE):
             return
-        self._create_tasks(project, specs, violations, tokens)
+        self._create_tasks(project, standard_tasks(specs))
 
-    def _create_tasks(
-        self,
-        project: Project,
-        specs: list[TaskSpec],
-        violations: dict[str, list[str]],
-        tokens: dict[str, int],
-    ) -> None:
-        review = bool((project.gates or {}).get("plan_approval", True)) or bool(violations)
+    def _create_tasks(self, project: Project, specs: list[TaskSpec]) -> None:
+        review = bool((project.gates or {}).get("plan_approval", True))
         initial = TaskState.PROPOSED if review else TaskState.QUEUED
         ordered = topo_order(specs)
         ids: dict[str, int] = {}
@@ -457,29 +413,13 @@ class JobRunner:
                 )
             )
             for t in ordered:
-                row = Task(
-                    project_id=self.project_id,
-                    key=t.key,
-                    title=t.title,
-                    description=t.description,
-                    todos=t.todos,
-                    req_refs=t.req_refs,
-                    allowed_globs=t.allowed_files,
-                    context_files=t.context_files,
-                    validation_cmd=t.validation_cmd,
-                    deps=[ids[d] for d in t.deps],
-                    size_violations=violations.get(t.key, []),
-                    pack_tokens=tokens.get(t.key, 0),
-                    state=initial,
-                )
+                row = task_row(self.project_id, t, deps=[ids[d] for d in t.deps], state=initial)
                 s.add(row)
                 s.flush()
                 assert row.id is not None
                 ids[t.key] = row.id
             s.commit()
-        rows: list[dict[str, Any]] = [
-            {**t.__dict__, "violations": violations.get(t.key, [])} for t in ordered
-        ]
+        rows: list[dict[str, Any]] = [t.__dict__ for t in ordered]
         gitops.write_and_commit(
             self.project_id,
             {doc_path(project, "tasks"): render_tasks_md(project, rows)},
@@ -493,10 +433,12 @@ class JobRunner:
                 s.add(p)
                 s.commit()
         set_phase(self.project_id, ProjectPhase.PLAN_REVIEW if review else ProjectPhase.EXECUTE)
-        summary = f"Broke the plan into {len(ordered)} tasks."
-        if violations:
-            summary += f" {len(violations)} still exceed the size limits and need attention."
-        planner_note(self.project_id, summary, self.job_id)
+        planner_note(
+            self.project_id,
+            f"Broke the plan into {len(ordered)} tasks, including setup, acceptance tests and "
+            "documentation.",
+            self.job_id,
+        )
 
     # -- split ---------------------------------------------------------------
 
@@ -513,32 +455,20 @@ class JobRunner:
         if task is None or task.state not in (TaskState.FAILED, TaskState.BLOCKED):
             raise JobFailed("the task is no longer waiting to be split")
         failures = [r.reason for r in runs[-4:] if r.reason] or [self.payload.get("reason", "")]
-        docs = read_docs(project)
-        tree = repo_files(gitops.repo_dir(self.project_id))
-        budget = budget_tokens(project, self._executor_window(project))
         original = {
             "key": task.key or f"T{task.id}",
             "title": task.title,
-            "description": task.description,
+            "goal": task.description,
             "req_refs": task.req_refs,
-            "todos": task.todos,
-            "allowed_files": task.allowed_globs,
-            "context_files": task.context_files,
-            "validation_cmd": task.validation_cmd,
+            "criteria": task.criteria,
             "deps": [],
+            "size": "medium",
         }
-        system = split_system_prompt(project, docs, tree, budget, original, failures)
-        specs, violations, tokens = await self._plan_loop(
-            node, model, project, system, "Split the task now.", "task split"
-        )
-        if violations:
-            raise JobFailed(
-                "the smaller tasks still exceed the size limits: "
-                + "; ".join(f"{k}: {', '.join(v)}" for k, v in violations.items())
-            )
+        system = split_system_prompt(project, read_docs(project), original, failures)
+        specs = await self._plan_loop(node, model, system, "Split the task now.", "task split")
         if not finish_job(self.job_id, (JobState.RUNNING,), JobState.DONE):
             return
-        children = replace_task(task, specs, tokens, origin="split")
+        children = replace_task(task, specs, origin="split")
         write_tasks_md(project)
         emit(
             self.project_id,
@@ -553,9 +483,22 @@ class JobRunner:
         await run_review(self, node, model)
 
 
-def replace_task(
-    task: Task, specs: list[TaskSpec], tokens: dict[str, int], origin: str
-) -> list[Task]:
+def task_row(project_id: int, t: TaskSpec, **fields: Any) -> Task:
+    """A task table row from a Task Planner task."""
+    return Task(
+        project_id=project_id,
+        key=t.key,
+        title=t.title,
+        description=t.goal,
+        req_refs=t.req_refs,
+        criteria=t.criteria,
+        kind=t.kind,
+        pack_tokens=estimate_tokens(t.goal + " ".join(t.criteria)),
+        **fields,
+    )
+
+
+def replace_task(task: Task, specs: list[TaskSpec], origin: str) -> list[Task]:
     """Swap a task for new ones (split). Dependents now wait for all of them."""
     assert task.id is not None
     base = task.key or f"T{task.id}"
@@ -564,24 +507,17 @@ def replace_task(
     ids: dict[str, int] = {}
     with session() as s:
         for t in topo_order(specs):
-            row = Task(
-                project_id=task.project_id,
-                key=keymap[t.key],
-                title=t.title,
-                description=t.description,
-                todos=t.todos,
-                req_refs=t.req_refs,
-                allowed_globs=t.allowed_files,
-                context_files=t.context_files,
-                validation_cmd=t.validation_cmd,
+            row = task_row(
+                task.project_id,
+                t,
                 deps=[*task.deps, *[ids[d] for d in t.deps]],
-                pack_tokens=tokens.get(t.key, 0),
                 parent_id=task.id,
                 origin=origin,
                 executor_kind=task.executor_kind,
                 timeout_s=task.timeout_s,
                 state=TaskState.QUEUED,
             )
+            row.key = keymap[t.key]
             s.add(row)
             s.flush()
             assert row.id is not None
@@ -614,13 +550,11 @@ def write_tasks_md(project: Project) -> None:
         {
             "key": t.key or f"#{t.id}",
             "title": t.title,
-            "description": t.description,
+            "goal": t.description,
+            "criteria": t.criteria,
             "req_refs": t.req_refs,
             "deps": [keys.get(d, f"#{d}") for d in t.deps],
-            "allowed_files": t.allowed_globs,
-            "context_files": t.context_files,
-            "validation_cmd": t.validation_cmd,
-            "todos": t.todos,
+            "kind": t.kind,
             "violations": t.size_violations,
             "state": t.state.value,
         }

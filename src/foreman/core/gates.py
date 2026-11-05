@@ -82,12 +82,14 @@ def pending(
         return list(s.exec(q.order_by(col(Gate.id))).all())
 
 
-def resolve(gate_id: int, approve: bool, note: str = "") -> Gate | None:
+def resolve(gate_id: int, approve: bool, note: str = "", action: str = "") -> Gate | None:
     """Record the user's decision (API side). Returns None if not pending."""
     with session() as s:
         gate = s.get(Gate, gate_id)
         if gate is None or gate.state != GateState.PENDING:
             return None
+        if action:
+            gate.payload = {**(gate.payload or {}), "action": action}
         gate.state = GateState.APPROVED if approve else GateState.REJECTED
         gate.note, gate.resolved_at = note, now()
         s.add(gate)

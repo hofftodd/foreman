@@ -157,6 +157,7 @@ class PiExecutor:
     kind = "pi"
     needs_node = True
     prompt_overhead_tokens = 1500  # measured: ~1.4k (system prompt + 4 tool schemas)
+    providers = frozenset({"openai"})  # pi talks to the gateway's chat completions API
 
     def prepare(
         self,
@@ -167,6 +168,8 @@ class PiExecutor:
         ctl_dir: Path,
         prompt: str,
         context: ExecutorContext | None = None,
+        provider: str = "openai",
+        role: str = "",
     ) -> ExecutorInvocation:
         if not endpoint or not model:
             raise ValueError("pi executor needs a model endpoint and a model")

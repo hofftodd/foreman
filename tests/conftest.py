@@ -28,6 +28,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("FOREMAN_POLL_INTERVAL_S", "0.1")
     monkeypatch.setenv("FOREMAN_STOP_GRACE_S", "2")
     monkeypatch.setenv("FOREMAN_GATEWAY_PORT", "0")  # ephemeral: tests run side by side
+    monkeypatch.setenv("FOREMAN_NODE_CHECK_S", "0")  # tests call check_nodes() themselves
     monkeypatch.delenv("FOREMAN_TOKEN", raising=False)
     reset_engine_cache()
     return data

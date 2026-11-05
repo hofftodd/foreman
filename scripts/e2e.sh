@@ -12,7 +12,15 @@ mkdir -p "${E2E_TMPDIR:-${TMPDIR:-/tmp}}"
 work="$(mktemp -d "${E2E_TMPDIR:-${TMPDIR:-/tmp}}/foreman-e2e.XXXXXX")"
 port="${FOREMAN_PORT:-8711}"
 llm_port="${FAKE_LLM_PORT:-8712}"
-trap 'kill "${pid:-0}" "${llm_pid:-0}" 2>/dev/null || true; wait "${pid:-0}" 2>/dev/null || true; rm -rf "$work"' EXIT
+cleanup() {
+  kill "${pid:-0}" "${llm_pid:-0}" 2>/dev/null || true
+  wait "${pid:-0}" 2>/dev/null || true
+  # The throwaway installation's gateway relay and sandbox network.
+  (cd "$root" && FOREMAN_DATA_DIR="$work/data" uv run python -c \
+    "from foreman.sandbox import teardown_isolation; teardown_isolation()" >/dev/null 2>&1) || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
 
 # Origin repo (override the location with ORIGIN_REPO, e.g. for nicer screenshots)
 origin="${ORIGIN_REPO:-$work/origin.git}"

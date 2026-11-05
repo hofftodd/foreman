@@ -16,6 +16,7 @@ from foreman.core.models import (
     PlanRevision,
     ProjectPhase,
     RevisionState,
+    SpecMessage,
     Task,
     TaskRun,
     TaskState,
@@ -35,19 +36,20 @@ class Planner:
     def __init__(self) -> None:
         self.splits: list[Any] = []
         self.reviews: list[Any] = []
+        self.chat = "ok"  # Project Planner turns
         self.calls: list[str] = []
 
     def __call__(self, req: dict[str, Any]) -> str:
         sys = system_text(req)
-        if "Split ONE task" in sys:
+        if "Split it into" in sys:
             self.calls.append("split")
             out = self.splits.pop(0) if self.splits else "[]"
-        elif "You review the plan" in sys:
+        elif "reviewing the plan" in sys:
             self.calls.append("review")
             out = self.reviews.pop(0) if self.reviews else {"summary": "on track", "ops": []}
         else:
             self.calls.append("other")
-            out = "ok"
+            out = self.chat
         return out if isinstance(out, str) else json.dumps(out)
 
 
@@ -184,15 +186,13 @@ async def test_split_after_retries(client, origin, llm, planner):
             {
                 "key": "S1",
                 "title": "First half",
-                "allowed_files": ["one.txt"],
-                "validation_cmd": "true",
+                "criteria": ["it works"],
                 "deps": [],
             },
             {
                 "key": "S2",
                 "title": "Second half",
-                "allowed_files": ["two.txt"],
-                "validation_cmd": "true",
+                "criteria": ["it works"],
                 "deps": ["S1"],
             },
         ]
@@ -287,8 +287,7 @@ async def test_replan_after_task_applies_ops(client, origin, llm, planner):
                     "task": {
                         "key": "TC",
                         "title": "Docs",
-                        "allowed_files": ["DOCS.md"],
-                        "validation_cmd": "true",
+                        "criteria": ["it works"],
                         "deps": ["TA"],
                     },
                     "reason": "users need docs",
@@ -320,8 +319,7 @@ async def test_replan_growth_cap_needs_approval(client, origin, llm, planner):
             "task": {
                 "key": f"N{i}",
                 "title": f"New {i}",
-                "allowed_files": [f"n{i}.txt"],
-                "validation_cmd": "true",
+                "criteria": ["it works"],
             },
             "reason": "needed",
         }
@@ -369,11 +367,17 @@ async def test_spec_change_is_always_gated(client, origin, llm, planner):
     orch = Orchestrator()
     await drive(orch, lambda: bool(gates_of(p["id"], GateKind.SPEC_CHANGE)))
     (gate,) = gates_of(p["id"], GateKind.SPEC_CHANGE)
+    # Approved: the Project Planning Agent (not Foreman, not the Task Planner) edits the
+    # documents. This older project keeps its original spec.md name.
+    planner.chat = "Done.\n<<<FILE specs/001-initial/spec.md\n# Spec\n- FR-1 x\n- FR-2 login\n>>>"
     client.post(f"/api/gates/{gate.id}/resolve", json={"approve": True})
     await drive(
         orch,
-        lambda: "Add FR-2 login" in gitops.read_repo_file(p["id"], "specs/001-initial/spec.md"),
+        lambda: "FR-2 login" in gitops.read_repo_file(p["id"], "specs/001-initial/spec.md"),
     )
+    with session() as s:
+        asked = s.exec(select(SpecMessage).where(SpecMessage.role == "user")).all()
+    assert "Add FR-2 login" in asked[-1].content
 
 
 # -- milestone ------------------------------------------------------------------------------

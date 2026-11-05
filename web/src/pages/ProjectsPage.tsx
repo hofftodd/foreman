@@ -13,6 +13,47 @@ const PHASE_LABEL: Record<Project["phase"], string> = {
   done: "done",
 };
 
+function planned(p: Project) {
+  const c = p.task_counts ?? {};
+  const total = Object.entries(c).reduce((n, [k, v]) => (k === "discarded" || k === "split" ? n : n + (v ?? 0)), 0);
+  return { done: c.done ?? 0, total };
+}
+
+function Portfolio({ projects, nodes }: { projects: Project[]; nodes: Node[] }) {
+  const running = projects.filter((p) => p.active_task).length;
+  const waiting = projects.reduce((n, p) => n + (p.pending_gates ?? 0), 0);
+  const spend = projects.reduce((n, p) => n + p.spend_usd, 0);
+  const busy = nodes.reduce((n, x) => n + x.active, 0);
+  const slots = nodes.reduce((n, x) => n + x.capacity, 0);
+  const tiles = [
+    { label: "projects working", value: `${running} / ${projects.length}` },
+    { label: "need you", value: String(waiting), to: "/inbox" },
+    { label: "node slots busy", value: `${busy} / ${slots}`, to: "/nodes" },
+    { label: "cloud spend", value: `$${spend.toFixed(2)}` },
+  ];
+  return (
+    <div className="stats">
+      {tiles.map((t) => {
+        const body = (
+          <>
+            <div className="stat-value">{t.value}</div>
+            <div className="stat-label">{t.label}</div>
+          </>
+        );
+        return t.to ? (
+          <Link key={t.label} to={t.to} className="stat">
+            {body}
+          </Link>
+        ) : (
+          <div key={t.label} className="stat">
+            {body}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Counts({ p }: { p: Project }) {
   const c = p.task_counts ?? {};
   const active = (c.running ?? 0) + (c.validating ?? 0);
@@ -24,6 +65,23 @@ function Counts({ p }: { p: Project }) {
       {(c.failed ?? 0) > 0 && <span className="warn">{c.failed} failed</span>}
       {(c.stopped_by_user ?? 0) > 0 && <span className="warn">{c.stopped_by_user} stopped</span>}
       {(c.blocked ?? 0) > 0 && <span className="warn">{c.blocked} blocked</span>}
+    </div>
+  );
+}
+
+function ProgressBar({ p }: { p: Project }) {
+  const { done, total } = planned(p);
+  if (!total) return null;
+  return (
+    <div title={`${done} of ${total} tasks done`}>
+      <div className="progress">
+        <div className="progress-fill" style={{ width: `${(done / total) * 100}%` }} />
+      </div>
+      <div className="small muted">
+        {done} of {total} tasks done
+        {p.coverage != null && ` · ${Math.round(p.coverage)}% test coverage`}
+        {p.spend_usd > 0 && ` · $${p.spend_usd.toFixed(2)} spent`}
+      </div>
     </div>
   );
 }
@@ -192,10 +250,10 @@ function AddProject({ onDone }: { onDone: (p: Project) => void }) {
             {plannerNode?.models.map((m) => <option key={m} value={m} />)}
           </datalist>
         </Field>
-        <Field label="Executor node" hint="Runs the coding agent; must be local / OpenAI-compatible">
+        <Field label="Executor node" hint="Runs the coding agent (its key never enters the sandbox)">
           <select value={form.node_id} onChange={(e) => set("node_id", e.target.value)}>
             <option value="">— none —</option>
-            {nodes?.filter((n) => n.provider === "openai").map((n) => (
+            {nodes?.map((n) => (
               <option key={n.id} value={n.id}>
                 {n.name}
               </option>
@@ -225,6 +283,7 @@ function AddProject({ onDone }: { onDone: (p: Project) => void }) {
 
 export default function ProjectsPage() {
   const { data: projects, error } = usePoll<Project[]>("/api/projects", 3000);
+  const { data: nodes } = usePoll<Node[]>("/api/nodes", 5000);
   const [adding, setAdding] = useState(false);
   const navigate = useNavigate();
 
@@ -238,6 +297,7 @@ export default function ProjectsPage() {
       </div>
       <ErrorNote error={error} />
       {adding && <AddProject onDone={(p) => navigate(`/projects/${p.id}`)} />}
+      {!!projects?.length && <Portfolio projects={projects} nodes={nodes ?? []} />}
       {projects?.length === 0 && !adding && <p className="muted">No projects yet. Add one to get started.</p>}
       <div className="cards">
         {projects?.map((p) => (
@@ -251,7 +311,10 @@ export default function ProjectsPage() {
             </div>
             <div className="muted mono small">{p.repo_url}</div>
             <div className="muted small">→ {p.milestone_branch}</div>
+            <ProgressBar p={p} />
+            {p.active_task && <div className="small">▶ {p.active_task}</div>}
             <Counts p={p} />
+            {(p.pending_gates ?? 0) > 0 && <div className="small warn">needs you: {p.pending_gates}</div>}
           </Link>
         ))}
       </div>

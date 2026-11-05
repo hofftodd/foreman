@@ -3,7 +3,10 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { control, del, patch, post } from "../api";
 import { ActionButton, ErrorNote, EventLog, Field, StateBadge, StopButton, lines } from "../components";
 import { useEventStream, usePoll } from "../hooks";
-import type { Node, PlanRevision, Project, ProjectPhase, SystemInfo, Task, TaskState } from "../types";
+import type { CoveragePoint, Node, PlanRevision, Project, ProjectPhase, RoleInfo, SystemInfo, Task, TaskState, TestRun } from "../types";
+import CoverageChart from "../CoverageChart";
+import ProgressChart, { type ProgressPoint } from "../ProgressChart";
+import { CaseList, RunSummary } from "./TaskPage";
 import PlanReview from "./PlanReview";
 import SpecWorkspace from "./SpecWorkspace";
 
@@ -41,8 +44,7 @@ function AddTask({ project, tasks, onDone }: { project: Project; tasks: Task[]; 
   const [f, setF] = useState({
     title: "",
     description: "",
-    todos: "",
-    allowed_globs: "",
+    criteria: "",
     validation_cmd: "",
     deps: [] as number[],
     executor_kind: "",
@@ -52,6 +54,7 @@ function AddTask({ project, tasks, onDone }: { project: Project; tasks: Task[]; 
   const [error, setError] = useState("");
   const set = (k: string, v: unknown) => setF((x) => ({ ...x, [k]: v }));
   const kind = f.executor_kind || project.executor_kind;
+  const scripted = kind === "shell";
 
   return (
     <form
@@ -61,9 +64,14 @@ function AddTask({ project, tasks, onDone }: { project: Project; tasks: Task[]; 
         setError("");
         try {
           await post(`/api/projects/${project.id}/tasks`, {
-            ...f,
-            todos: lines(f.todos),
-            allowed_globs: lines(f.allowed_globs),
+            title: f.title,
+            description: f.description,
+            deps: f.deps,
+            executor_kind: f.executor_kind,
+            timeout_s: f.timeout_s,
+            ...(scripted
+              ? { executor_script: f.executor_script, validation_cmd: f.validation_cmd }
+              : { criteria: lines(f.criteria) }),
           });
           onDone();
         } catch (err) {
@@ -72,22 +80,23 @@ function AddTask({ project, tasks, onDone }: { project: Project; tasks: Task[]; 
       }}
     >
       <h2>Add task</h2>
+      <p className="small muted">
+        {scripted
+          ? "A scripted task: the shell executor runs your script, then your check."
+          : "Describe the work in plain language. The Tester Agent writes its tests from the criteria, then the Builder Agent makes them pass."}
+      </p>
       <div className="grid2">
         <Field label="Title">
           <input required value={f.title} onChange={(e) => set("title", e.target.value)} />
         </Field>
-        <Field label="Validation command" hint="Exit 0 = task done. Runs in the sandbox.">
-          <input required className="mono" value={f.validation_cmd} placeholder="pytest -q tests/test_parser.py" onChange={(e) => set("validation_cmd", e.target.value)} />
+        <Field label="Goal">
+          <textarea rows={3} value={f.description} onChange={(e) => set("description", e.target.value)} />
         </Field>
-        <Field label="Description / requirement slice">
-          <textarea rows={4} value={f.description} onChange={(e) => set("description", e.target.value)} />
-        </Field>
-        <Field label="Todos" hint="One per line">
-          <textarea rows={4} value={f.todos} onChange={(e) => set("todos", e.target.value)} />
-        </Field>
-        <Field label="Allowed files" hint="Globs, one per line. Empty = unrestricted.">
-          <textarea rows={3} className="mono" value={f.allowed_globs} placeholder={"src/parser.py\ntests/test_parser.py"} onChange={(e) => set("allowed_globs", e.target.value)} />
-        </Field>
+        {!scripted && (
+          <Field label="Done when" hint="Plain-language criteria, one per line">
+            <textarea required rows={4} value={f.criteria} placeholder={"Searching shows matching todos\nAn empty search shows everything"} onChange={(e) => set("criteria", e.target.value)} />
+          </Field>
+        )}
         <Field label="Depends on">
           <select multiple value={f.deps.map(String)} onChange={(e) => set("deps", Array.from(e.target.selectedOptions, (o) => Number(o.value)))}>
             {tasks.filter((t) => t.state !== "discarded").map((t) => (
@@ -103,13 +112,18 @@ function AddTask({ project, tasks, onDone }: { project: Project; tasks: Task[]; 
             {sys?.executors.map((x) => <option key={x}>{x}</option>)}
           </select>
         </Field>
-        <Field label="Timeout (s)">
+        <Field label="Timeout per step (s)">
           <input type="number" min={10} value={f.timeout_s} onChange={(e) => set("timeout_s", Number(e.target.value))} />
         </Field>
-        {kind === "shell" && (
-          <Field label="Shell script" hint="The shell executor runs this instead of an AI agent">
-            <textarea rows={4} className="mono" value={f.executor_script} onChange={(e) => set("executor_script", e.target.value)} />
-          </Field>
+        {scripted && (
+          <>
+            <Field label="Shell script" hint="Runs instead of an AI agent">
+              <textarea rows={4} className="mono" value={f.executor_script} onChange={(e) => set("executor_script", e.target.value)} />
+            </Field>
+            <Field label="Check command" hint="Exit 0 = done">
+              <input required className="mono" value={f.validation_cmd} onChange={(e) => set("validation_cmd", e.target.value)} />
+            </Field>
+          </>
         )}
       </div>
       <ErrorNote error={error} />
@@ -124,14 +138,12 @@ function RoleFields({
   binding,
   onChange,
   listId,
-  allowCloud,
 }: {
   label: string;
   nodes: Node[] | null;
   binding: { node_id: string; model: string };
   onChange: (b: { node_id: string; model: string }) => void;
   listId: string;
-  allowCloud: boolean;
 }) {
   const node = nodes?.find((n) => String(n.id) === binding.node_id);
   return (
@@ -139,13 +151,11 @@ function RoleFields({
       <Field label={`${label} node`}>
         <select value={binding.node_id} onChange={(e) => onChange({ ...binding, node_id: e.target.value })}>
           <option value="">— none —</option>
-          {nodes
-            ?.filter((n) => allowCloud || n.provider === "openai")
-            .map((n) => (
-              <option key={n.id} value={n.id}>
-                {n.name} {n.provider === "anthropic" ? "(Claude)" : ""}
-              </option>
-            ))}
+          {nodes?.map((n) => (
+            <option key={n.id} value={n.id}>
+              {n.name} {n.provider === "anthropic" ? "(Claude)" : ""}
+            </option>
+          ))}
         </select>
       </Field>
       <Field label={`${label} model`}>
@@ -158,12 +168,15 @@ function RoleFields({
 
 function Settings({ project, onSaved }: { project: Project; onSaved: () => void }) {
   const { data: nodes } = usePoll<Node[]>("/api/nodes", 10000);
-  const b = (role: string) => {
-    const x = project.role_bindings[role] ?? { node_id: null, model: "" };
+  // Older projects bound "planner" and "executor": each agent falls back to those.
+  const b = (...keys: string[]) => {
+    const x = keys.map((k) => project.role_bindings[k]).find((v) => v?.node_id) ?? { node_id: null, model: "" };
     return { node_id: x.node_id ? String(x.node_id) : "", model: x.model };
   };
-  const [executor, setExecutor] = useState(b("executor"));
-  const [planner, setPlanner] = useState(b("planner"));
+  const [projectPlanner, setProjectPlanner] = useState(b("project_planner", "planner"));
+  const [taskPlanner, setTaskPlanner] = useState(b("task_planner", "planner"));
+  const [tester, setTester] = useState(b("tester", "executor"));
+  const [builder, setBuilder] = useState(b("builder", "executor"));
   const [escalation, setEscalation] = useState(b("escalation"));
   const wd = project.watchdog_effective;
   const ge = project.gates_effective ?? {};
@@ -191,6 +204,9 @@ function Settings({ project, onSaved }: { project: Project; onSaved: () => void 
     max_task_files: project.max_task_files,
     context_budget_pct: project.context_budget_pct,
     plan_approval: project.gates?.plan_approval !== false,
+    spend_cap_usd: project.spend_cap_usd,
+    min_task_coverage: project.min_task_coverage,
+    test_paths: project.test_paths.join(", "),
   });
   const [error, setError] = useState("");
   const set = (k: string, v: unknown) => setF((x) => ({ ...x, [k]: v }));
@@ -211,12 +227,16 @@ function Settings({ project, onSaved }: { project: Project; onSaved: () => void 
             push_after_merge: f.push_after_merge,
             max_task_files: f.max_task_files,
             context_budget_pct: f.context_budget_pct,
+            spend_cap_usd: f.spend_cap_usd,
+            min_task_coverage: f.min_task_coverage,
+            test_paths: f.test_paths.split(",").map((x) => x.trim()).filter(Boolean),
             gates: { ...project.gates, plan_approval: f.plan_approval, ...g },
             watchdog: { ...project.watchdog, ...w },
             role_bindings: {
-              ...project.role_bindings,
-              executor: toBinding(executor),
-              planner: toBinding(planner),
+              project_planner: toBinding(projectPlanner),
+              task_planner: toBinding(taskPlanner),
+              tester: toBinding(tester),
+              builder: toBinding(builder),
               escalation: toBinding(escalation),
             },
           });
@@ -227,15 +247,19 @@ function Settings({ project, onSaved }: { project: Project; onSaved: () => void 
       }}
     >
       <h2>Settings</h2>
-      <h3>Models</h3>
+      <h3>Agents</h3>
+      <p className="small muted">Which model each agent uses. Each agent can only do what its role allows.</p>
       <div className="grid2">
-        <RoleFields label="Planner" nodes={nodes} binding={planner} onChange={setPlanner} listId="planner-models" allowCloud />
-        <RoleFields label="Executor" nodes={nodes} binding={executor} onChange={setExecutor} listId="executor-models" allowCloud={false} />
-        <RoleFields label="Escalation" nodes={nodes} binding={escalation} onChange={setEscalation} listId="escalation-models" allowCloud={false} />
-        <Field label="Executor">
+        <RoleFields label="Project Planner" nodes={nodes} binding={projectPlanner} onChange={setProjectPlanner} listId="pp-models" />
+        <RoleFields label="Task Planner" nodes={nodes} binding={taskPlanner} onChange={setTaskPlanner} listId="tp-models" />
+        <RoleFields label="Tester" nodes={nodes} binding={tester} onChange={setTester} listId="tester-models" />
+        <RoleFields label="Builder" nodes={nodes} binding={builder} onChange={setBuilder} listId="builder-models" />
+        <RoleFields label="Escalation" nodes={nodes} binding={escalation} onChange={setEscalation} listId="escalation-models" />
+        <Field label="Coding agent" hint="Runs the Tester and Builder">
           <select value={f.executor_kind} onChange={(e) => set("executor_kind", e.target.value)}>
             <option>pi</option>
             <option>opencode</option>
+            <option>aider</option>
             <option>shell</option>
           </select>
         </Field>
@@ -254,8 +278,23 @@ function Settings({ project, onSaved }: { project: Project; onSaved: () => void 
         <Field label="Context budget (% of executor window)">
           <input type="number" min={5} max={90} value={f.context_budget_pct} onChange={(e) => set("context_budget_pct", Number(e.target.value))} />
         </Field>
-        <Field label="Project test command" hint="Runs after every task to catch regressions">
+      </div>
+      <h3>Tests</h3>
+      <div className="grid2">
+        <Field label="Minimum coverage of changed lines (%)" hint="Below it, the task goes back to the Tester once, then asks you. 0 = only report">
+          <input type="number" min={0} max={100} value={f.min_task_coverage} onChange={(e) => set("min_task_coverage", Number(e.target.value))} />
+        </Field>
+        <Field label="Test paths" hint="Comma-separated. Only the Tester may change files here">
+          <input className="mono" value={f.test_paths} onChange={(e) => set("test_paths", e.target.value)} />
+        </Field>
+        <Field label="Test command override" hint="Empty: the Tester's tests/run.sh">
           <input className="mono" value={f.test_cmd} onChange={(e) => set("test_cmd", e.target.value)} />
+        </Field>
+      </div>
+      <h3>Spend</h3>
+      <div className="grid2">
+        <Field label="Spend cap (USD)" hint={`Paid (cloud) model calls stop here and ask you. 0 = no cap. Spent so far: $${project.spend_usd.toFixed(2)}`}>
+          <input type="number" min={0} step={0.5} value={f.spend_cap_usd} onChange={(e) => set("spend_cap_usd", Number(e.target.value))} />
         </Field>
       </div>
       <h3>Watchdog (per task attempt)</h3>
@@ -312,13 +351,125 @@ function Settings({ project, onSaved }: { project: Project; onSaved: () => void 
   );
 }
 
+function Progress({ project }: { project: Project }) {
+  const { data } = usePoll<ProgressPoint[]>(`/api/projects/${project.id}/progress`, 10000);
+  const capped = project.spend_cap_usd > 0;
+  return (
+    <section className="card">
+      <div className="row">
+        <h2>Progress</h2>
+        {(project.spend_usd > 0 || capped) && (
+          <span className="small">
+            Spend <b>${project.spend_usd.toFixed(2)}</b>
+            {capped && <span className="muted"> of ${project.spend_cap_usd.toFixed(2)} cap</span>}
+          </span>
+        )}
+      </div>
+      <ProgressChart points={data ?? []} now={Date.now() / 1000} />
+    </section>
+  );
+}
+
+function Tests({ project }: { project: Project }) {
+  const { data } = usePoll<{ suite: TestRun | null; acceptance: TestRun | null }>(`/api/projects/${project.id}/tests`, 10000);
+  const { data: trend } = usePoll<CoveragePoint[]>(`/api/projects/${project.id}/coverage-trend`, 10000);
+  const [all, setAll] = useState(false);
+  const suite = data?.suite;
+  const acceptance = data?.acceptance;
+  const slowest = (suite?.cases ?? []).slice().sort((a, b) => b.duration_s - a.duration_s).slice(0, 5);
+  return (
+    <section className="card">
+      <div className="row">
+        <h2>Tests</h2>
+        <span className="small muted">
+          minimum {project.min_task_coverage}% of each task's changed lines covered
+        </span>
+      </div>
+      {!suite ? (
+        <p className="muted small">No suite results yet. The Tester sets up the test runner in the first task.</p>
+      ) : (
+        <>
+          <div className="small muted">
+            Latest suite: after task <Link to={`/tasks/${suite.task_id}`}>#{suite.task_id}</Link>, commit{" "}
+            <span className="mono">{suite.commit.slice(0, 8)}</span>
+          </div>
+          <RunSummary run={suite} />
+          <CoverageChart points={trend ?? []} />
+          <div className="row">
+            <h3>{all ? "All tests" : "Failing tests"}</h3>
+            <button type="button" className="btn small" onClick={() => setAll((x) => !x)}>
+              {all ? "Show failing only" : `Show all ${suite.cases?.length ?? 0}`}
+            </button>
+          </div>
+          {all ? (
+            <CaseList cases={suite.cases ?? []} />
+          ) : suite.failed + suite.errors === 0 ? (
+            <p className="small ok-text">Every test passes.</p>
+          ) : (
+            <CaseList cases={(suite.cases ?? []).filter((c) => c.status === "failed" || c.status === "error")} />
+          )}
+          {slowest.some((c) => c.duration_s > 0) && (
+            <>
+              <h3>Slowest tests</h3>
+              <ul className="small">
+                {slowest.map((c) => (
+                  <li key={c.id}>
+                    <span className="mono">{c.name}</span> <span className="muted">{c.duration_s.toFixed(2)}s</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      )}
+      {acceptance && (
+        <>
+          <h3>
+            Acceptance tests{" "}
+            <span className={`badge ${acceptance.failed + acceptance.errors ? "test-failed" : "test-passed"}`}>
+              {acceptance.passed} of {acceptance.passed + acceptance.failed + acceptance.errors} passing
+            </span>
+          </h3>
+          <CaseList cases={acceptance.cases ?? []} />
+        </>
+      )}
+    </section>
+  );
+}
+
+function Roles() {
+  const { data } = usePoll<RoleInfo[]>("/api/roles", 600000);
+  if (!data) return null;
+  return (
+    <section className="card">
+      <h2>Agents and what they may do</h2>
+      <p className="small muted">Fixed by Foreman. The Orchestrator refuses anything outside an agent's role and logs it.</p>
+      <div className="roles">
+        {data.map((r) => (
+          <div key={r.key} className="role">
+            <b>{r.name}</b>
+            <div className="small muted">{r.summary}</div>
+            <ul className="small may">
+              {r.may.map((m) => <li key={m}>✓ {m}</li>)}
+            </ul>
+            <ul className="small may-not">
+              {r.may_not.map((m) => <li key={m}>✗ {m}</li>)}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function Milestone({ project }: { project: Project }) {
   const checked = !!project.acceptance_commit;
   return (
     <section className={`card milestone ${project.phase === "done" ? "milestone-done" : ""}`}>
       <div className="row">
         <div>
-          <b>Definition of done:</b> <code>{project.acceptance_cmd || project.test_cmd || "(none set)"}</code>
+          <b>Definition of done:</b>{" "}
+          <code>{project.acceptance_cmd || "the acceptance tests (tests/acceptance/run.sh)"}</code>
         </div>
         <div className="small">
           {project.phase === "done" ? (
@@ -468,13 +619,19 @@ export default function ProjectPage() {
       {panel === "add" && (
         <AddTask project={project} tasks={all} onDone={() => { setPanel(""); reloadTasks(); }} />
       )}
-      {panel === "settings" && <Settings project={project} onSaved={() => { setPanel(""); reload(); }} />}
+      {panel === "settings" && (
+        <>
+          <Settings project={project} onSaved={() => { setPanel(""); reload(); }} />
+          <Roles />
+        </>
+      )}
 
       {(project.phase === "specify" || project.phase === "decomposing") && <SpecWorkspace project={project} />}
       {project.phase === "plan_review" && <PlanReview project={project} onChange={() => { reload(); reloadTasks(); }} />}
       {(project.phase === "execute" || project.phase === "done") && (
       <>
       <Milestone project={project} />
+      <Progress project={project} />
       <div className="board">
         {COLUMNS.map((col) => {
           const items = all.filter((t) => col.states.includes(t.state));
@@ -495,6 +652,7 @@ export default function ProjectPage() {
         </h2>
         <EventLog events={activity} />
       </section>
+      <Tests project={project} />
       <Revisions projectId={project.id} />
       </>
       )}

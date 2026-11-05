@@ -129,13 +129,14 @@ and default role bindings.
 - Configurable gates + "Needs you" inbox + ntfy notifications.
 - Milestone PRs on GitHub.
 
-### M4 — Hosts, pi, egress (part 1 ✅, see §11); multi-node & polish
+### M4 — Hosts, pi, egress; multi-node & polish ✅ (see §11–12)
 - macOS hosting next to Linux (Lima VM), pi executor (default), executor
-  network locked to the gateway. ✅
+  network locked to the gateway.
 - Multi-node scheduling with capacities, node health view.
 - Cloud spend tracking and caps.
 - Portfolio dashboard, validation trend charts.
-- Crash-recovery hardening.
+- Aider executor; crash-recovery hardening.
+- Carried over from M3: per-project toolchain images.
 
 ## 7. Risks
 
@@ -387,3 +388,169 @@ context budget is now `pct × (window − overhead)`.
 - Hosted CI covers macOS without Docker only; Docker/Lima on a Mac is a manual check.
 - The relay forwards to the gateway port only; package registries during
   agent runs need the "open" network (a registry allowlist is possible later).
+
+## 12. M4 part 2 implementation notes: multi-node, spend, portfolio, Aider, Claude
+
+- **Egress lockdown**: built on both lines of work at once; the merged code
+  uses part 1's design (§11: `foreman-exec-<instance>` network, `foreman-gw`
+  relay, `Project.network` "isolated" | "open"). Projects saved with this
+  line's earlier name for it, "gateway", are renamed to "isolated" on start.
+- **Toolchain images** (`images.py`, merged from the `local-node-and-toolchains`
+  branch): `.foreman/Dockerfile` must build `FROM foreman/executor-base`
+  (checked, so agents stay unprivileged). Only `.foreman/` is the build context.
+  The image is tagged by a hash of the Dockerfile, the files it COPYs/ADDs and
+  the base image id, built before each attempt and acceptance check if missing
+  (builds have network; tasks don't; Stop kills a build), and used for every
+  container of that step. A bad Dockerfile or failed build is a configuration
+  failure.
+- **Multi-node scheduling** (`orchestrator/main.py`): node load = running
+  task attempts + running planner jobs; both count against `Node.capacity`.
+  Nodes are health-checked every `FOREMAN_NODE_CHECK_S` (model list fetch,
+  15 s timeout); a node whose last check failed gets no new work, and
+  "unreachable" / "back" transitions are logged as events. A node never
+  checked gets the benefit of the doubt. `/api/nodes` reports `active` and
+  `waiting` per node; `PATCH /api/nodes/{id}` edits capacity, prices etc.
+- **Spend** (FR-9.3, `core/spend.py`): `Node.price_in/out` in USD per
+  million tokens; `Project.spend_usd` accumulates the cost of every call on a
+  priced node, from planner jobs (reported usage) and the gateway (reported
+  usage, else estimates). At `Project.spend_cap_usd` an always-on BUDGET
+  gate opens once; paid calls are refused (gateway: 429 + a "spend cap"
+  watchdog trip; planner jobs wait; the scheduler starts no task or job on a
+  priced node). A task cut off by the cap is re-queued without counting as a
+  failure. Approving the gate extends the cap by its original amount;
+  rejecting pauses the project; editing the cap in settings cancels or opens
+  the gate as appropriate.
+- **Portfolio** (`ProjectsPage`, `ProgressChart`): summary tiles (projects
+  working, open checkpoints, node slots busy, cloud spend), a progress bar,
+  active task and open checkpoints per project, and per project a step chart
+  of tasks done vs. tasks planned, computed from task creation times and
+  state-change events (`GET /api/projects/{id}/progress`). Discarded and
+  split tasks leave the plan. The chart has a crosshair tooltip, direct
+  labels, a legend and a table view.
+- **Aider** (`executors/aider.py`): optional in the base image
+  (`foreman build-image --with-aider`). One-shot `--message-file` run against
+  the gateway, with the task's literal allowed files in the chat and its
+  context files read-only; Foreman commits. An executor command can exit 78
+  (`EXIT_CONFIG`) to mean "can't work as configured" (e.g. Aider not
+  installed), which blocks the task instead of retrying it.
+- **Crash recovery** (`recover()` on orchestrator start, NFR-2): besides
+  failing open runs and planner jobs, it kills and clears interrupted
+  acceptance checks (they re-run, no result was recorded) and restores each
+  main clone: stale `index.lock` removed, unfinished merge aborted, milestone
+  branch checked out, uncommitted changes from a cut-off write dropped. Each
+  repair is logged as an event on the project.
+
+- **Claude in every role** (post-M4): the gateway also serves Claude's native
+  Messages API (`/g/<token>/v1/messages` → `api.anthropic.com`, key added as
+  `x-api-key` on the host, usage incl. cache reads/writes priced at their
+  rates). OpenCode uses its built-in Anthropic provider pointed at the gateway;
+  Aider stays OpenAI-compatible only (its tasks block with a clear message).
+  Requests are adapted for current models (fixed thinking budgets → adaptive,
+  sampling parameters dropped). Planner calls run at effort `high`.
+  `foreman claude-nodes` creates Opus / Sonnet / Haiku nodes with prices;
+  `scripts/claude_smoke.py` runs a capped idea-to-done project against them.
+
+### Validation coverage after M4 part 2
+
+| Check | Status |
+|---|---|
+| V4.3 node capacity never exceeded | ✅ `test_node_capacity_respected`, `test_tasks_spread_over_nodes_up_to_capacity`, `test_planner_jobs_share_node_capacity` |
+| V4.4 executor containers can't reach other hosts | ✅ `test_isolated_network_reaches_only_the_gateway` (§11) |
+| Node health | ✅ `test_health_checks_mark_nodes_and_announce_changes`, `test_unhealthy_node_gets_no_tasks` |
+| V9.1 restart leaves nothing stuck | ✅ M1 tests plus `tests/test_recovery.py` (interrupted merge, dirty clone, wrong branch, acceptance) |
+| V10.1 spend cap → budget gate, cloud calls stop | ✅ `test_planner_spend_reaches_cap_and_waits_for_approval`, `test_priced_node_charges_and_stops_at_cap`, `test_tasks_on_priced_nodes_wait_at_the_cap`, `test_rejecting_the_budget_pauses_the_project`, `test_raising_the_cap_in_settings_clears_the_checkpoint` |
+| Toolchain images | ✅ `tests/test_images.py`, `test_tasks_run_in_the_project_toolchain_image`, `test_broken_toolchain_fails_as_configuration`, `test_toolchain_must_derive_from_base` |
+| Aider | ✅ command construction and "not installed → blocked, not retried" (`tests/test_recovery.py`). Not run against a real model in CI. |
+| Portfolio / progress | ✅ `test_progress_series_and_portfolio_fields`; screenshots via `scripts/screenshots.sh` |
+
+### Known gaps
+
+- Token counts fall back to estimates when a server doesn't report usage, so
+  spend on such servers is approximate.
+- Regression detection is exit-code based.
+- Aider has only been exercised with the scripted test setup, not real models.
+- Projects still run one task at a time each; parallelism comes from running
+  several projects across nodes.
+- GitHub Issues integration remains a future enhancement (spec §9).
+
+## 13. Strict agent roles (post-M4)
+
+The single planner and single coding agent are replaced by four agents with
+fixed capabilities, managed by the (model-free) orchestrator. The design came
+from a diagram by the project owner; the mermaid version is in
+[`ARCHITECTURE.md`](../../ARCHITECTURE.md#the-four-agents).
+
+- **Role registry** (`core/roles.py`): `ROLES` names each agent, what it may
+  and may not do, and its model binding (`project_planner`, `task_planner`,
+  `tester`, `builder`; `escalation` stays a stronger-model tier for Tester and
+  Builder steps). Older projects' `planner` binding serves both planners and
+  `executor` serves Tester and Builder (`roles.binding`). Refusals are
+  `denied` events. `GET /api/roles` feeds the dashboard's read-only panel.
+- **Planning documents**: `specs/<feature>/requirements.md`, `design.md`,
+  `acceptance-criteria.md` (human-readable markdown, no code or paths) and the
+  generated `tasks.md`. Projects with the old `spec.md` / `plan.md` /
+  `validation.md` keep reading them (`roles.doc_file`). Approval needs the
+  three documents, no acceptance command.
+- **Project Planner**: writes only the three documents (anything else in its
+  reply is refused). It may research: on Claude via the server-side
+  `web_search` / `web_fetch` tools (`pause_turn` resumed up to 5 times); on
+  OpenAI-compatible models via `web_search` / `web_fetch` function tools that
+  Foreman runs (`research.py`: SearXNG at `FOREMAN_SEARCH_URL`; fetch refuses
+  private, loopback and link-local addresses and doesn't follow redirects).
+  Without a search service local models get no tools.
+- **Task Planner**: plain-language tasks `{key, title, goal, req_refs,
+  criteria (≤ 6), deps, size}`; file and command fields are refused
+  (`parse_task_items`, `replan.validate_ops`). `standard_tasks()` frames every
+  plan with SETUP (first), ACCEPT (acceptance tests) and DOCS (last:
+  `README.md` and `ARCHITECTURE.md`). Approved spec changes queue a Project
+  Planner chat job instead of editing documents directly.
+- **Tester → Builder pipeline** (`orchestrator/runner.py`): each task runs a
+  Tester step and a Builder step, each its own `TaskRun` (`step`) with its own
+  binding, budget and context pack (`contextpack.build_role_pack`).
+  - Mounts (`sandbox.StepSpec`): Tester gets a read-only workspace with
+    writable test paths; Builder gets read-only test paths. Both get
+    `$FOREMAN_RESULTS` (`/foreman-results`).
+  - Fences: after each step the diff is checked with `roles.fence` (test
+    paths plus test-file name patterns such as `*_test.go`, `*.spec.ts`); a
+    violation resets the step's changes and fails it (`failure_kind="fence"`).
+  - The Tester must add tests and the suite runner `tests/run.sh` (and, for
+    ACCEPT, `tests/acceptance/run.sh`); its run is recorded "red". The Builder
+    must leave the whole suite green.
+  - A retry after a Builder failure keeps the Tester's commit
+    (`tests_ready`, `tests_commit`); "send back to Tester" on an escalation
+    gate clears it.
+- **Test results** (`testresults.py`, `TestRun` / `TestCase`): JUnit XML plus
+  Cobertura or LCOV from `$FOREMAN_RESULTS`. A task's own tests are the cases
+  in files its Tester changed. Changed-line coverage = instrumented lines added
+  since the task's base that the tests hit. Below `Project.min_task_coverage`
+  (default 80; 0 = report only) the task goes back to the Tester once, then a
+  COVERAGE gate asks (approve merges; reject sends back).
+  - API: `GET /api/tasks/{id}/tests`, `/api/projects/{id}/tests`,
+    `/api/projects/{id}/coverage-trend`.
+  - Dashboard: the task Tests tab, the project Tests section with a coverage
+    line chart (one 0–100% axis, tooltip, table view) and coverage on project
+    cards.
+- **Acceptance**: the definition of done defaults to `sh
+  tests/acceptance/run.sh`; its results are stored as an `acceptance` TestRun.
+- **Manual tasks**: agent tasks take a goal and criteria only. Scripted
+  (`shell`) tasks keep a validation command, or use `{"tester": ..., "builder":
+  ...}` role scripts to go through the same pipeline (used by the tests,
+  e2e and screenshots).
+
+### Validation coverage for the roles
+
+| Check | Status |
+|---|---|
+| Planners can't write code, tests, commands or file-level tasks | ✅ `test_planner_may_not_write_code_tests_or_commands`, `test_planner_prompts_think_in_plain_language`, replan op validation in `tests/test_autonomy.py` |
+| Standard tasks always framed | ✅ `test_standard_tasks_frame_the_plan`, `tests/test_spec_flow.py` |
+| Tester first (red), Builder makes green, results stored and served | ✅ `test_tester_then_builder_red_to_green` |
+| Tester can't change code / Builder can't change tests (fence) | ✅ `test_tester_may_not_change_code`, `test_builder_may_not_change_tests` |
+| …nor inside their containers (mounts) | ✅ `test_tester_cannot_write_code_inside_its_container`, `test_builder_cannot_write_tests_inside_its_container` (`tests/test_docker.py`) |
+| Every task has tests | ✅ `test_every_task_needs_tests` |
+| Coverage send-back, gate, report-only | ✅ `test_low_coverage_goes_back_to_the_tester_then_asks`, `test_coverage_minimum_zero_only_reports` |
+| Send back to Tester | ✅ `test_blocked_task_can_go_back_to_the_tester` |
+| Result parsing and changed-line coverage | ✅ `tests/test_testresults.py` |
+| Old bindings map to the new roles | ✅ `test_role_bindings_fall_back_for_older_projects` |
+| Web research (local and Claude), private addresses refused | ✅ `tests/test_research.py` |
+| Real agents (pi, OpenCode), idea to done | ✅ `test_spec_to_done_with_agent[pi]`, `[opencode]` (Docker) |
+| Browser flow | ✅ `web/e2e/spec.spec.ts` (documents → five tasks → done) |

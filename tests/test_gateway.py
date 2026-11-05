@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from foreman.core.models import Node, Project, Task, TaskRun, TaskState
+from foreman.core.models import Node, Project, RunState, Task, TaskRun, TaskState
 from foreman.core.state import transition
 from foreman.db import session
 from foreman.gateway import Gateway, new_token, serve
@@ -171,3 +171,44 @@ async def test_models_passthrough(gw, llm):
     r = await _a(lambda: httpx.get(f"{gw}/g/{run.gateway_token}/v1/models", timeout=10))
     assert r.status_code == 200 and r.json()["data"][0]["id"] == "fake-coder"
     assert reload(run).model_requests == 0  # only chat calls count
+
+
+async def test_priced_node_charges_and_stops_at_cap(gw, llm):
+    run = make_run(llm, {"repeat_limit": 99})
+    with session() as s:
+        node = s.get(Node, run.node_id)
+        p = s.get(Project, run.project_id)
+        assert node is not None and p is not None
+        node.price_in = 100_000.0  # 10 prompt tokens a call -> $1
+        p.spend_cap_usd = 1.0
+        s.add(node)
+        s.add(p)
+        s.commit()
+    assert (await _a(chat, gw, run)).status_code == 200
+    with session() as s:
+        p = s.get(Project, run.project_id)
+        assert p is not None and p.spend_usd == pytest.approx(1.0)
+    r = await _a(chat, gw, run)
+    assert r.status_code == 429 and "spend cap reached" in r.text
+    assert reload(run).watchdog.startswith("spend cap reached")
+
+
+def test_budget_failure_requeues_without_counting():
+    from foreman.orchestrator.escalation import after_failure
+
+    with session() as s:
+        p = Project(name="p", repo_url="x")
+        s.add(p)
+        s.commit()
+        t = Task(project_id=p.id, title="t", state=TaskState.FAILED)
+        s.add(t)
+        s.commit()
+        run = TaskRun(task_id=t.id, project_id=p.id, failure_kind="budget", state=RunState.FAILED)
+        s.add(run)
+        s.commit()
+        tid, rid = t.id, run.id
+    d = after_failure(tid, rid)
+    assert d is not None and d.action == "retry"
+    with session() as s:
+        t = s.get(Task, tid)
+        assert t is not None and t.state == TaskState.QUEUED and t.level_failures == 0

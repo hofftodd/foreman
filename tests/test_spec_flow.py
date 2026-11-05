@@ -28,61 +28,52 @@ from tests.helpers import TERMINAL, drive, project
 
 FEATURE = "specs/001-initial"
 
-SPEC = """# Spec: greeter
-- FR-1.1 `greet(name)` returns "hello, <name>".
-- FR-1.2 A CLI prints the greeting.
+REQUIREMENTS = """# Requirements: greeter
+- FR-1.1 Greeting a name gives "hello, <name>".
+- FR-1.2 A command line prints the greeting.
 """
-PLAN = "# Plan\n- src/greet.py: greet()\n- src/cli.py: CLI\n"
-VALIDATION = "# Validation\n- V1 (FR-1.1) greet('bob') == 'hello, bob'\n"
+DESIGN = "# Design\nA greeting part and a command-line part that uses it.\n"
+ACCEPTANCE = "# Acceptance criteria\n- AC-1 (FR-1.1) Greeting bob gives hello, bob\n"
 
 CHAT_REPLY = f"""I drafted everything.
 
-<<<FILE {FEATURE}/spec.md
-{SPEC}>>>
-<<<FILE {FEATURE}/plan.md
-{PLAN}>>>
-<<<FILE {FEATURE}/validation.md
-{VALIDATION}>>>
-<<<FILE tests/acceptance/check.sh
-test -f greet.txt
->>>
-<<<ACCEPTANCE_CMD
-sh tests/acceptance/check.sh
->>>
+<<<FILE {FEATURE}/requirements.md
+{REQUIREMENTS}>>>
+<<<FILE {FEATURE}/design.md
+{DESIGN}>>>
+<<<FILE {FEATURE}/acceptance-criteria.md
+{ACCEPTANCE}>>>
 Anything else?"""
 
 GOOD_TASKS = [
     {
         "key": "T1",
         "title": "Write greeter",
+        "goal": "Greet a person by name.",
         "req_refs": ["FR-1.1"],
-        "todos": ["create greet.txt"],
-        "allowed_files": ["greet.txt"],
-        "context_files": [],
-        "validation_cmd": "true",
+        "criteria": ["Greeting bob gives hello, bob"],
         "deps": [],
     },
     {
         "key": "T2",
         "title": "Write CLI",
+        "goal": "Print the greeting from the command line.",
         "req_refs": ["FR-1.2"],
-        "todos": [],
-        "allowed_files": ["cli.txt"],
-        "context_files": [],
-        "validation_cmd": "true",
+        "criteria": ["Running it with bob prints hello, bob"],
         "deps": ["T1"],
     },
 ]
-TOO_BIG = [{**GOOD_TASKS[0], "allowed_files": ["a.txt", "b.txt", "c.txt", "d.txt"]}]
+TOO_BIG = [{**GOOD_TASKS[0], "criteria": [f"criterion {i}" for i in range(7)]}]
+PLANNED = ["SETUP", "ACCEPT", "T1", "T2", "DOCS"]  # with the standard tasks
 
 
 def scripted(chat: str = CHAT_REPLY, decompose: list[Any] | Callable[[int], Any] = GOOD_TASKS):
     calls = {"decompose": 0}
 
     def planner(req: dict[str, Any]) -> str:
-        if "You review the plan" in system_text(req):
+        if "reviewing the plan" in system_text(req):
             return json.dumps({"summary": "on track", "ops": []})
-        if "Break the approved plan" in system_text(req):
+        if "break the project into small, ordered tasks" in system_text(req):
             calls["decompose"] += 1
             out = decompose(calls["decompose"]) if callable(decompose) else decompose
             return out if isinstance(out, str) else "```json\n" + json.dumps(out) + "\n```"
@@ -106,7 +97,10 @@ def spec_project(client, origin, llm, **kw) -> dict[str, Any]:
         "name": "greeter",
         "repo_url": str(origin),
         "executor_kind": "shell",
-        "role_bindings": {"planner": {"node_id": n["id"], "model": "fake"}},
+        "role_bindings": {
+            "project_planner": {"node_id": n["id"], "model": "fake"},
+            "task_planner": {"node_id": n["id"], "model": "fake"},
+        },
         **kw,
     }
     r = client.post("/api/projects", json=body)
@@ -139,16 +133,16 @@ async def test_chat_writes_and_commits_documents(client, origin, llm):
     assert job_states(p["id"]) == [JobState.DONE]
 
     spec = client.get(f"/api/projects/{p['id']}/spec").json()
-    assert spec["docs"]["spec"].strip() == SPEC.strip()
-    assert spec["acceptance_cmd"] == "sh tests/acceptance/check.sh"
+    assert spec["docs"]["requirements"].strip() == REQUIREMENTS.strip()
+    assert spec["docs"]["design"].strip() == DESIGN.strip()
+    assert spec["paths"]["acceptance"] == f"{FEATURE}/acceptance-criteria.md"
     roles = [m["role"] for m in spec["messages"]]
     assert roles == ["user", "assistant"]
     reply = spec["messages"][1]
-    assert "[wrote specs/001-initial/spec.md]" in reply["content"]
-    assert "tests/acceptance/check.sh" in reply["files"]
+    assert f"[wrote {FEATURE}/requirements.md]" in reply["content"]
+    assert f"{FEATURE}/acceptance-criteria.md" in reply["files"]
 
     repo = gitops.repo_dir(p["id"])
-    assert (repo / "tests/acceptance/check.sh").exists()
     log = git("log", "--format=%s", cwd=repo)
     assert "spec: I drafted everything." in log
     # The planner saw the user's message.
@@ -161,7 +155,7 @@ async def test_second_turn_sees_current_documents(client, origin, llm):
     await chat(client, orch, p["id"], "Build a greeter.")
     await chat(client, orch, p["id"], "Looks good.")
     sys = system_text(llm.requests[-1])
-    assert "FR-1.1 `greet(name)`" in sys  # docs are in the system prompt
+    assert "FR-1.1 Greeting a name" in sys  # docs are in the system prompt
     roles = [m["role"] for m in llm.requests[-1]["messages"] if m["role"] != "system"]
     assert roles == ["user", "assistant", "user"]
 
@@ -175,23 +169,27 @@ def test_cannot_chat_while_planner_busy(client, origin, llm):
 
 async def test_user_can_edit_documents(client, origin, llm):
     p = spec_project(client, origin, llm)
-    r = client.put(f"/api/projects/{p['id']}/spec/docs/plan", json={"content": "# My plan"})
+    r = client.put(f"/api/projects/{p['id']}/spec/docs/design", json={"content": "# My design"})
     assert r.status_code == 200
-    assert client.get(f"/api/projects/{p['id']}/spec").json()["docs"]["plan"] == "# My plan\n"
+    docs = client.get(f"/api/projects/{p['id']}/spec").json()["docs"]
+    assert docs["design"] == "# My design\n"
     assert (
         client.put(f"/api/projects/{p['id']}/spec/docs/tasks", json={"content": "x"}).status_code
         == 400
     )
 
 
-async def test_spec_approval_requires_documents_and_command(client, origin, llm):
+async def test_spec_approval_requires_the_three_documents(client, origin, llm):
     p = spec_project(client, origin, llm)
     r = client.post(f"/api/projects/{p['id']}/spec/approve")
     assert r.status_code == 400 and "missing documents" in r.json()["detail"]
-    for name in ("spec", "plan", "validation"):
+    for name in ("requirements", "design"):
         client.put(f"/api/projects/{p['id']}/spec/docs/{name}", json={"content": "x"})
     r = client.post(f"/api/projects/{p['id']}/spec/approve")
-    assert r.status_code == 400 and "acceptance command" in r.json()["detail"]
+    assert r.status_code == 400 and "acceptance" in r.json()["detail"]
+    client.put(f"/api/projects/{p['id']}/spec/docs/acceptance", json={"content": "x"})
+    # No acceptance command needed: the Tester writes the acceptance tests later.
+    assert client.post(f"/api/projects/{p['id']}/spec/approve").status_code == 200
 
 
 async def test_full_flow_spec_to_done(client, origin, llm):
@@ -209,31 +207,33 @@ async def test_full_flow_spec_to_done(client, origin, llm):
 
     with session() as s:
         tasks = s.exec(select(Task).where(Task.project_id == pid).order_by(col(Task.id))).all()
-    assert [(t.key, t.state) for t in tasks] == [
-        ("T1", TaskState.PROPOSED),
-        ("T2", TaskState.PROPOSED),
-    ]
-    assert tasks[1].deps == [tasks[0].id]
-    assert tasks[0].size_violations == [] and tasks[0].pack_tokens > 0
+    assert [t.key for t in tasks] == PLANNED
+    assert all(t.state == TaskState.PROPOSED for t in tasks)
+    by_key = {t.key: t for t in tasks}
+    assert by_key["T2"].deps == [by_key["T1"].id] and by_key["T1"].deps == [by_key["SETUP"].id]
+    assert by_key["T1"].criteria == ["Greeting bob gives hello, bob"]
+    assert by_key["T1"].description == "Greet a person by name."
+    assert [t.kind for t in tasks] == ["setup", "acceptance", "feature", "feature", "docs"]
+    assert by_key["T1"].size_violations == [] and by_key["T1"].pack_tokens > 0
     tasks_md = client.get(f"/api/projects/{pid}/spec").json()["docs"]["tasks"]
     assert "## T1: Write greeter" in tasks_md and "Depends on: T1" in tasks_md
+    assert "Done when:\n- Greeting bob gives hello, bob" in tasks_md
 
     # Proposed tasks never run before approval.
     for _ in range(3):
         await orch.tick()
     assert all(t.state == TaskState.PROPOSED for t in [task_row(t.id) for t in tasks])
 
-    # Make T1 actually produce what the acceptance test checks.
+    # The scripted shell executor stands in for the agents: T1 writes a file.
     client.patch(
-        f"/api/tasks/{tasks[0].id}",
+        f"/api/tasks/{by_key['T1'].id}",
         json={"executor_kind": "shell", "executor_script": "echo hi > greet.txt"},
     )
     r = client.post(f"/api/projects/{pid}/plan/approve")
-    assert r.status_code == 200 and r.json()["queued"] == 2
+    assert r.status_code == 200 and r.json()["queued"] == len(PLANNED)
     assert project(pid).phase == ProjectPhase.EXECUTE
-    await drive(orch, lambda: task_row(tasks[1].id).state in TERMINAL)
-    assert task_row(tasks[0].id).state == TaskState.DONE
-    assert task_row(tasks[1].id).state == TaskState.DONE
+    await drive(orch, lambda: task_row(by_key["DOCS"].id).state in TERMINAL, timeout=60)
+    assert all(task_row(t.id).state == TaskState.DONE for t in tasks)
     assert (gitops.repo_dir(pid) / "greet.txt").exists()
 
 
@@ -255,26 +255,33 @@ async def test_oversized_task_is_sent_back_to_be_split(client, origin, llm):
     p = spec_project(client, origin, llm)
     await approved(client, Orchestrator(), p["id"])
     retry = last_user_text(llm.requests[-1])
-    assert "touches 4 files (limit 3)" in retry and "COMPLETE corrected" in retry
+    assert "7 criteria (limit 6)" in retry and "COMPLETE corrected" in retry
     with session() as s:
         keys = [t.key for t in s.exec(select(Task).where(Task.project_id == p["id"]))]
-    assert keys == ["T1", "T2"]
+    assert keys == PLANNED
 
 
-async def test_persistent_violations_block_plan_approval(client, origin, llm):
+async def test_persistent_violations_fail_the_breakdown(client, origin, llm):
     llm.planner = scripted(decompose=TOO_BIG)
     p = spec_project(client, origin, llm)
     pid = p["id"]
     await approved(client, Orchestrator(), pid)
-    assert project(pid).phase == ProjectPhase.PLAN_REVIEW
+    assert project(pid).phase == ProjectPhase.SPECIFY  # nothing too big is ever proposed
+    assert job_states(pid)[-1] == JobState.FAILED
+
+
+async def test_user_edits_are_size_checked(client, origin, llm):
+    p = spec_project(client, origin, llm)
+    pid = p["id"]
+    await approved(client, Orchestrator(), pid)
     with session() as s:
-        t = s.exec(select(Task).where(Task.project_id == pid)).one()
-    assert "touches 4 files (limit 3)" in t.size_violations
+        t = s.exec(select(Task).where(Task.project_id == pid, Task.key == "T1")).one()
+    many = [f"criterion {i}" for i in range(7)]
+    edited = client.patch(f"/api/tasks/{t.id}", json={"criteria": many}).json()
+    assert "7 criteria (limit 6); split it" in edited["size_violations"]
     r = client.post(f"/api/projects/{pid}/plan/approve")
     assert r.status_code == 400 and "size limits" in r.json()["detail"]
-
-    # The user splits it by hand: editing re-runs the size check.
-    fixed = client.patch(f"/api/tasks/{t.id}", json={"allowed_globs": ["a.txt"]}).json()
+    fixed = client.patch(f"/api/tasks/{t.id}", json={"criteria": many[:2]}).json()
     assert fixed["size_violations"] == []
     assert client.post(f"/api/projects/{pid}/plan/approve").status_code == 200
 
@@ -303,7 +310,7 @@ async def test_reopen_and_redecompose(client, origin, llm):
     assert client.post(f"/api/projects/{pid}/plan/redecompose").status_code == 200
     await drive(orch, lambda: project(pid).phase == ProjectPhase.PLAN_REVIEW)
     with session() as s:
-        assert len(s.exec(select(Task).where(Task.project_id == pid)).all()) == 2
+        assert len(s.exec(select(Task).where(Task.project_id == pid)).all()) == len(PLANNED)
     assert client.post(f"/api/projects/{pid}/spec/reopen").status_code == 200
     assert project(pid).phase == ProjectPhase.SPECIFY
     with session() as s:
@@ -324,7 +331,7 @@ async def test_stop_aborts_planner_mid_stream_and_applies_nothing(client, origin
     client.post("/api/controls", json={"scope": "project", "target_id": pid, "action": "stop"})
     await drive(orch, lambda: job_states(pid)[-1] == JobState.STOPPED)
     assert llm.disconnected.wait(5)
-    assert not (gitops.repo_dir(pid) / FEATURE / "spec.md").exists()
+    assert not (gitops.repo_dir(pid) / FEATURE / "requirements.md").exists()
 
 
 async def test_missing_planner_binding_fails_the_job(client, origin):
@@ -337,25 +344,16 @@ async def test_missing_planner_binding_fails_the_job(client, origin):
     assert job.state == JobState.FAILED and "no planner" in job.error
 
 
-def test_cloud_nodes_cannot_be_executors(client, origin):
-    n = client.post(
-        "/api/nodes",
-        json={
-            "name": "claude",
-            "provider": "anthropic",
-            "base_url": "https://api.anthropic.com",
-            "api_key": "sk",
-        },
-    ).json()
+def test_bindings_must_name_existing_nodes(client, origin):
     r = client.post(
         "/api/projects",
         json={
             "name": "x",
             "repo_url": str(origin),
-            "role_bindings": {"executor": {"node_id": n["id"], "model": "claude-opus-5-5"}},
+            "role_bindings": {"escalation": {"node_id": 999, "model": "m"}},
         },
     )
-    assert r.status_code == 400 and "not executors" in r.json()["detail"]
+    assert r.status_code == 400 and "escalation node not found" in r.json()["detail"]
 
 
 async def test_tasks_do_not_run_before_execute_phase(client, origin, llm):
@@ -432,41 +430,35 @@ async def test_plan_approval_rejects_dependencies_on_dropped_tasks(client, origi
 
 
 async def test_runs_to_done_without_any_input_when_optional_gates_are_off(client, origin, llm):
-    """V7.1: after spec approval, three tasks run, are reviewed, pass acceptance and the
+    """V7.1: after spec approval, the tasks run, are reviewed, pass acceptance and the
     project finishes without a single checkpoint."""
-    chat_reply = CHAT_REPLY.replace("sh tests/acceptance/check.sh", "test -f c.txt")
     three = [
-        {**GOOD_TASKS[0], "allowed_files": ["a.txt"]},
-        {**GOOD_TASKS[1], "allowed_files": ["b.txt"]},
-        {
-            "key": "T3",
-            "title": "Third",
-            "allowed_files": ["c.txt"],
-            "validation_cmd": "true",
-            "deps": ["T2"],
-        },
+        *GOOD_TASKS,
+        {"key": "T3", "title": "Third", "goal": "g", "criteria": ["c"], "deps": ["T2"]},
     ]
-    llm.planner = scripted(chat=chat_reply, decompose=three)
+    llm.planner = scripted(decompose=three)
     p = spec_project(client, origin, llm, gates={"plan_approval": False, "milestone": False})
     pid = p["id"]
+    client.patch(f"/api/projects/{pid}", json={"acceptance_cmd": "test -f c.txt"})
     orch = Orchestrator()
     await chat(client, orch, pid, "Build it.")
     assert client.post(f"/api/projects/{pid}/spec/approve").status_code == 200
     await drive(orch, lambda: project(pid).phase == ProjectPhase.EXECUTE)
-    # The shell executor stands in for the coding agent: each task writes its file.
+    # The shell executor stands in for the agents: each feature task writes its file.
+    files = {"T1": "a.txt", "T2": "b.txt", "T3": "c.txt"}
     with session() as s:
         for t in s.exec(select(Task).where(Task.project_id == pid)):
-            t.executor_script = f"echo ok > {t.allowed_globs[0]}"
+            t.executor_script = f"echo ok > {files[t.key]}" if t.key in files else "true"
             s.add(t)
         s.commit()
-    await drive(orch, lambda: project(pid).phase == ProjectPhase.DONE, timeout=60)
+    await drive(orch, lambda: project(pid).phase == ProjectPhase.DONE, timeout=90)
     with session() as s:
         from foreman.core.models import Gate, PlanRevision
 
         assert s.exec(select(Gate).where(Gate.project_id == pid)).all() == []
         reviews = s.exec(select(PlanRevision).where(PlanRevision.project_id == pid)).all()
-    assert len(reviews) == 3  # one after each task
-    assert project(pid).acceptance_passed and project(pid).baseline_tasks == 3
+    assert len(reviews) == 6  # one after each task (3 planned + setup, acceptance, docs)
+    assert project(pid).acceptance_passed and project(pid).baseline_tasks == 6
 
 
 async def test_thinking_model_streams_reasoning_and_gets_room_to_think(client, origin, llm):

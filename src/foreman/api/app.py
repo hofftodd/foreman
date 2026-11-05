@@ -37,18 +37,24 @@ from foreman.api.schemas import (
 from foreman.api.spec import recheck_task_size
 from foreman.api.spec import router as spec_router
 from foreman.config import get_settings
-from foreman.core import gates, watchdog
+from foreman.core import gates, roles, spend, watchdog
 from foreman.core.models import (
     Control,
     ControlAction,
     ControlScope,
     Event,
+    Gate,
+    GateState,
+    JobState,
     Node,
+    PlannerJob,
     Project,
     ProjectPhase,
     Task,
     TaskRun,
     TaskState,
+    TestCase,
+    TestRun,
     now,
 )
 from foreman.core.state import (
@@ -66,6 +72,7 @@ from foreman.core.state import (
 )
 from foreman.db import control_session, session
 from foreman.executors import EXECUTORS
+from foreman.executors.shell import role_scripts
 from foreman.llm import list_models
 
 
@@ -93,10 +100,39 @@ def _get(model: type, id_: int | None) -> Any:
     return obj
 
 
-def _node_out(n: Node) -> dict[str, Any]:
+def _node_out(n: Node, load: dict[int, dict[str, int]] | None = None) -> dict[str, Any]:
     d = n.model_dump(exclude={"api_key"})
     d["has_api_key"] = bool(n.api_key)
+    d.update((load or {}).get(n.id or 0, {"active": 0, "waiting": 0}))
     return d
+
+
+def _node_load() -> dict[int, dict[str, int]]:
+    """Per node: work running on it now, and queued tasks that will run on it."""
+    from foreman.orchestrator.jobs import job_role
+    from foreman.orchestrator.main import node_load
+    from foreman.orchestrator.runner import resolve_executor
+
+    out: dict[int, dict[str, int]] = {}
+    for node_id, n in node_load().items():
+        out.setdefault(node_id, {"active": 0, "waiting": 0})["active"] = n
+    with session() as s:
+        projects = {p.id: p for p in s.exec(select(Project))}
+        queued = s.exec(select(Task).where(Task.state == TaskState.QUEUED)).all()
+        jobs = s.exec(select(PlannerJob).where(PlannerJob.state == JobState.QUEUED)).all()
+    for t in queued:
+        p = projects.get(t.project_id)
+        if p is None or p.phase != ProjectPhase.EXECUTE:
+            continue
+        _, task_node, _ = resolve_executor(p, t)
+        if task_node is not None:
+            out.setdefault(task_node, {"active": 0, "waiting": 0})["waiting"] += 1
+    for j in jobs:
+        p = projects.get(j.project_id)
+        bound = roles.binding(p, job_role(j.kind)).get("node_id") if p else None
+        if isinstance(bound, int):
+            out.setdefault(bound, {"active": 0, "waiting": 0})["waiting"] += 1
+    return out
 
 
 def _task_counts(project_id: int | None) -> dict[str, int]:
@@ -120,15 +156,17 @@ def _reopen(project_id: int) -> None:
 
 
 def _check_bindings(bindings: dict[str, Any]) -> None:
-    """Executors run in sandboxes; cloud providers' keys must never get there (NFR-5)."""
-    executor = bindings.get("executor") or {}
-    if executor.get("node_id") is not None:
+    """Known roles, existing nodes. (Any provider can serve the Tester and Builder: they
+    reach it through the model gateway, which holds the key - NFR-5.)"""
+    for role, binding in bindings.items():
+        if role not in (*roles.BINDING_KEYS, "planner", "executor"):
+            raise HTTPException(400, f"unknown role {role!r}")
+        node_id = (binding or {}).get("node_id")
+        if node_id is None:
+            continue
         with session() as s:
-            node = s.get(Node, executor["node_id"])
-        if node is None:
-            raise HTTPException(400, "executor node not found")
-        if node.provider != "openai":
-            raise HTTPException(400, f"{node.provider} nodes can be planners, not executors")
+            if s.get(Node, node_id) is None:
+                raise HTTPException(400, f"{role} node not found")
 
 
 def _check_deps(project_id: int, deps: list[int], self_id: int | None = None) -> None:
@@ -227,7 +265,63 @@ async def create_github_repo(body: GitHubRepoCreate) -> dict[str, str]:
 def list_projects() -> list[dict[str, Any]]:
     with session() as s:
         projects = s.exec(select(Project).order_by(col(Project.id))).all()
-    return [{**p.model_dump(), "task_counts": _task_counts(p.id)} for p in projects]
+        waiting: dict[int, int] = {}
+        for g in s.exec(select(Gate).where(Gate.state == GateState.PENDING)):
+            waiting[g.project_id] = waiting.get(g.project_id, 0) + 1
+        active = {
+            t.project_id: t.title
+            for t in s.exec(select(Task).where(col(Task.state).in_(ACTIVE_STATES)))
+        }
+        coverage: dict[int, float | None] = {}
+        for r in s.exec(select(TestRun).where(TestRun.step == "builder").order_by(col(TestRun.id))):
+            coverage[r.project_id] = r.coverage  # the latest verified run wins
+    return [
+        {
+            **p.model_dump(),
+            "task_counts": _task_counts(p.id),
+            "pending_gates": waiting.get(p.id or 0, 0),
+            "active_task": active.get(p.id or 0, ""),
+            "coverage": coverage.get(p.id or 0),
+        }
+        for p in projects
+    ]
+
+
+# Tasks that no longer count toward the plan.
+_OUT_OF_PLAN = {TaskState.DISCARDED.value, TaskState.SPLIT.value}
+
+
+@router.get("/api/projects/{project_id}/progress")
+def project_progress(project_id: int) -> list[dict[str, float]]:
+    """Tasks done vs. tasks planned over time, one point per change."""
+    _get(Project, project_id)
+    with session() as s:
+        tasks = s.exec(select(Task).where(Task.project_id == project_id)).all()
+        changes = s.exec(
+            select(Event)
+            .where(Event.project_id == project_id, Event.kind == "state")
+            .order_by(col(Event.id))
+        ).all()
+    timeline: list[tuple[float, int, str]] = [(t.created_at, t.id or 0, "") for t in tasks]
+    timeline += [(e.ts, e.task_id or 0, str(e.data.get("state", ""))) for e in changes]
+    timeline.sort(key=lambda x: x[0])
+    known = {t.id for t in tasks}
+    state: dict[int, str] = {}
+    points: list[dict[str, float]] = []
+    for ts, task_id, new_state in timeline:
+        if task_id not in known:
+            continue
+        state[task_id] = new_state or state.get(task_id, "queued")
+        planned = sum(1 for v in state.values() if v not in _OUT_OF_PLAN)
+        done = sum(1 for v in state.values() if v == TaskState.DONE.value)
+        point = {"ts": ts, "done": done, "planned": planned}
+        if points and points[-1]["done"] == done and points[-1]["planned"] == planned:
+            continue
+        if points and ts - points[-1]["ts"] < 1e-6:
+            points[-1] = point
+        else:
+            points.append(point)
+    return points
 
 
 @router.post("/api/projects", status_code=201)
@@ -249,6 +343,8 @@ async def create_project(body: ProjectCreate) -> Project:
         push_after_merge=body.push_after_merge,
         gates=body.gates,
         watchdog=body.watchdog,
+        spend_cap_usd=body.spend_cap_usd,
+        min_task_coverage=body.min_task_coverage,
     )
     with session() as s:
         s.add(p)
@@ -304,7 +400,9 @@ def update_project(project_id: int, body: ProjectUpdate) -> Project:
         s.add(p)
         s.commit()
         s.refresh(p)
-        return p
+    if "spend_cap_usd" in data:
+        spend.cap_changed(p)
+    return p
 
 
 @router.delete("/api/projects/{project_id}", status_code=204)
@@ -342,6 +440,18 @@ def create_task(project_id: int, body: TaskCreate) -> Task:
     p = _get(Project, project_id)
     if body.executor_kind and body.executor_kind not in EXECUTORS:
         raise HTTPException(400, f"unknown executor {body.executor_kind}")
+    if (body.executor_kind or p.executor_kind) == "shell":
+        # Scripted Tester/Builder steps are tested like agent tasks; plain scripts need a command.
+        if not body.validation_cmd.strip() and not role_scripts(body.executor_script):
+            raise HTTPException(400, "scripted (shell) tasks need a validation command")
+    else:
+        # Agent tasks: the Tester decides how to test them, from the criteria.
+        if body.validation_cmd or body.allowed_globs:
+            raise HTTPException(
+                400, "agent tasks take a goal and criteria; the Tester writes their tests"
+            )
+        if not [c for c in body.criteria if c.strip()]:
+            raise HTTPException(400, "give the task at least one acceptance criterion")
     _check_deps(project_id, body.deps)
     t = Task(project_id=project_id, **body.model_dump(), origin="manual")
     if p.phase == ProjectPhase.PLAN_REVIEW:
@@ -425,6 +535,87 @@ def discard_task(task_id: int) -> Task:
     return _get(Task, task_id)
 
 
+# -- test results and coverage ------------------------------------------------------
+
+
+def _run_out(run: TestRun, cases: list[TestCase] | None = None) -> dict[str, Any]:
+    out = run.model_dump()
+    if cases is not None:
+        out["cases"] = [c.model_dump() for c in cases]
+    return out
+
+
+def _cases(run_id: int | None) -> list[TestCase]:
+    with session() as s:
+        q = select(TestCase).where(TestCase.test_run_id == run_id).order_by(col(TestCase.id))
+        return list(s.exec(q))
+
+
+@router.get("/api/tasks/{task_id}/tests")
+def task_tests(task_id: int) -> dict[str, Any]:
+    """The task's test runs (Tester: red, Builder: green), newest first, the latest with
+    every case."""
+    _get(Task, task_id)
+    with session() as s:
+        runs = s.exec(
+            select(TestRun).where(TestRun.task_id == task_id).order_by(col(TestRun.id).desc())
+        ).all()
+    return {
+        "runs": [_run_out(r, _cases(r.id) if i == 0 else None) for i, r in enumerate(runs)],
+    }
+
+
+@router.get("/api/projects/{project_id}/tests")
+def project_tests(project_id: int) -> dict[str, Any]:
+    """The latest full-suite result for the project (the last merged task's verify run, or
+    the latest acceptance check), with its cases."""
+    _get(Project, project_id)
+    with session() as s:
+        latest = s.exec(
+            select(TestRun)
+            .where(TestRun.project_id == project_id, TestRun.step == "builder")
+            .order_by(col(TestRun.id).desc())
+        ).first()
+        acceptance = s.exec(
+            select(TestRun)
+            .where(TestRun.project_id == project_id, TestRun.step == "acceptance")
+            .order_by(col(TestRun.id).desc())
+        ).first()
+    return {
+        "suite": _run_out(latest, _cases(latest.id)) if latest else None,
+        "acceptance": _run_out(acceptance, _cases(acceptance.id)) if acceptance else None,
+    }
+
+
+@router.get("/api/projects/{project_id}/coverage-trend")
+def coverage_trend(project_id: int) -> list[dict[str, Any]]:
+    """Coverage and test counts after each verified task, oldest first."""
+    _get(Project, project_id)
+    with session() as s:
+        runs = s.exec(
+            select(TestRun)
+            .where(TestRun.project_id == project_id, TestRun.step == "builder")
+            .order_by(col(TestRun.id))
+        ).all()
+    return [
+        {
+            "ts": r.created_at,
+            "coverage": r.coverage,
+            "tests": r.passed + r.failed + r.errors,
+            "passed": r.passed,
+            "task_id": r.task_id,
+        }
+        for r in runs
+        if not r.problem
+    ]
+
+
+@router.get("/api/roles")
+def list_roles() -> list[dict[str, Any]]:
+    """The agents and what each may do (core/roles.py)."""
+    return roles.describe()
+
+
 @router.get("/api/tasks/{task_id}/diff")
 async def task_diff(task_id: int) -> dict[str, Any]:
     t = _get(Task, task_id)
@@ -439,8 +630,9 @@ async def task_diff(task_id: int) -> dict[str, Any]:
 
 @router.get("/api/nodes")
 def list_nodes() -> list[dict[str, Any]]:
+    load = _node_load()
     with session() as s:
-        return [_node_out(n) for n in s.exec(select(Node).order_by(col(Node.id)))]
+        return [_node_out(n, load) for n in s.exec(select(Node).order_by(col(Node.id)))]
 
 
 @router.post("/api/nodes", status_code=201)
@@ -461,11 +653,11 @@ def update_node(node_id: int, body: NodeUpdate) -> dict[str, Any]:
         if n is None:
             raise HTTPException(404, "node not found")
         for k, v in body.model_dump(exclude_unset=True).items():
-            setattr(n, k, v)
+            setattr(n, k, v.rstrip("/") if k == "base_url" else v)
         s.add(n)
         s.commit()
         s.refresh(n)
-        return _node_out(n)
+    return _node_out(n, _node_load())
 
 
 @router.delete("/api/nodes/{node_id}", status_code=204)

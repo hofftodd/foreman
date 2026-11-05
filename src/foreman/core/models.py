@@ -62,6 +62,8 @@ class GateKind(StrEnum):
     TASK_MERGE = "task_merge"  # a validated task waits to be merged
     ESCALATION = "escalation"  # a task is blocked; retry or discard
     MILESTONE = "milestone"  # acceptance passed; approve to push / open the PR
+    BUDGET = "budget"  # the project reached its spend cap; approve to raise it
+    COVERAGE = "coverage"  # a task's changed lines are under-tested; merge anyway or send back
 
 
 class GateState(StrEnum):
@@ -100,9 +102,11 @@ class Project(SQLModel, table=True):
     test_cmd: str = ""
     executor_kind: str = "pi"
     # Executor network: "isolated" (only the model gateway is reachable) or "open"
-    # (LAN and internet, for tests that need them). See foreman.sandbox.
+    # (LAN and internet, for tests that need them). See foreman.sandbox. Older rows
+    # may say "gateway", the earlier name for "isolated".
     network: str = "isolated"
-    # role -> {"node_id": int, "model": str}. Roles: "executor", "planner".
+    # role -> {"node_id": int, "model": str}. Roles: see core/roles.py (project_planner,
+    # task_planner, tester, builder, escalation; older projects: planner, executor).
     role_bindings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     # Optional checkpoints, e.g. {"plan_approval": true}. See core/gates.py.
     gates: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -131,6 +135,14 @@ class Project(SQLModel, table=True):
     paused: bool = False
     # When `paused` last changed; lets a late Stop avoid undoing a newer Resume.
     paused_at: float = 0.0
+    # Directories that hold tests: only the Tester writes there, and the Builder sees
+    # them read-only.
+    test_paths: list[str] = Field(default_factory=lambda: ["tests"], sa_column=Column(JSON))
+    # Coverage the Builder's changed lines must reach (percent; 0 = report only).
+    min_task_coverage: int = 80
+    # Spend on priced (cloud) nodes, in USD, and the cap that gates it (0 = no cap).
+    spend_usd: float = 0.0
+    spend_cap_usd: float = 0.0
     push_after_merge: bool = False
     clone_error: str = ""
     created_at: float = Field(default_factory=now)
@@ -151,6 +163,9 @@ class Node(SQLModel, table=True):
     models: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     healthy: bool | None = None
     last_checked: float | None = None
+    # USD per million tokens; 0 for local nodes. Priced nodes count against spend caps.
+    price_in: float = 0.0
+    price_out: float = 0.0
 
 
 class Task(SQLModel, table=True):
@@ -165,6 +180,15 @@ class Task(SQLModel, table=True):
     deps: list[int] = Field(default_factory=list, sa_column=Column(JSON))
     # Stable name from decomposition (e.g. "T3"), used for dependencies in tasks.md.
     key: str = ""
+    # setup | acceptance | feature | docs (see orchestrator/pipeline.py)
+    kind: str = "feature"
+    # Plain-language acceptance criteria for this task; the Tester turns them into tests.
+    criteria: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Tester step done: its tests are committed in the task clone at tests_commit.
+    tests_ready: bool = False
+    tests_commit: str = ""
+    # Times the task went back to the Tester for low coverage.
+    coverage_rounds: int = 0
     # Requirement ids from spec.md this task implements (e.g. ["FR-2.1"]).
     req_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     # Read-only files whose interfaces the task needs (signatures go in the context pack).
@@ -212,14 +236,58 @@ class TaskRun(SQLModel, table=True):
     watchdog: str = ""
     # Normalised hash of the failure output, to detect the same failure repeating.
     error_sig: str = ""
-    # config | watchdog | executor | validation | merge | internal
+    # config | watchdog | executor | validation | merge | internal | budget | coverage
     failure_kind: str = ""
+    # Which agent this run was: tester | builder ("" = a single-step scripted task).
+    step: str = ""
     diff_lines: int = 0
     state: RunState = RunState.RUNNING
     exit_code: int | None = None
     reason: str = ""
     started_at: float = Field(default_factory=now)
     ended_at: float | None = None
+
+
+class TestRun(SQLModel, table=True):
+    """One run of a project's test suite, with its results and coverage."""
+
+    __test__ = False  # not a pytest class
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(index=True)
+    task_id: int | None = Field(default=None, index=True)
+    run_id: int | None = None
+    # tester (tests written, expected to fail) | builder | acceptance
+    step: str = ""
+    commit: str = ""
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    duration_s: float = 0.0
+    # Line coverage of the whole project, and of the lines the Builder changed (percent).
+    coverage: float | None = None
+    changed_coverage: float | None = None
+    changed_lines: int = 0
+    # {file: {"covered": n, "total": n}}
+    files: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Why results are missing or incomplete (e.g. no junit.xml), else "".
+    problem: str = ""
+    created_at: float = Field(default_factory=now)
+
+
+class TestCase(SQLModel, table=True):
+    __test__ = False
+    id: int | None = Field(default=None, primary_key=True)
+    test_run_id: int = Field(foreign_key="testrun.id", index=True)
+    name: str
+    classname: str = ""
+    file: str = ""
+    # passed | failed | error | skipped
+    status: str = "passed"
+    duration_s: float = 0.0
+    message: str = ""
+    # Written by the Tester for this run's task.
+    task_test: bool = False
 
 
 class Event(SQLModel, table=True):

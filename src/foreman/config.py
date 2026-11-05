@@ -49,6 +49,11 @@ class Settings:
     # Managed Lima VM size (macOS); 0 = derived from this machine.
     vm_cpus: int = field(default_factory=lambda: int(_env("VM_CPUS", "0")))
     vm_memory_gib: int = field(default_factory=lambda: int(_env("VM_MEMORY_GIB", "0")))
+    # Web search for the Project Planning Agent on local models: a SearXNG URL (JSON
+    # output enabled). Claude nodes use Anthropic's own search and need nothing here.
+    search_url: str = field(default_factory=lambda: _env("SEARCH_URL", ""))
+    # How often the orchestrator checks each node's health.
+    node_check_s: float = field(default_factory=lambda: float(_env("NODE_CHECK_S", "60")))
 
     @property
     def db_path(self) -> Path:

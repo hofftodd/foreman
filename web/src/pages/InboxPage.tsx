@@ -10,8 +10,10 @@ const ACTIONS: Record<GateKind, { label: string; approve: string; reject: string
   task_merge: { label: "Merge", approve: "Merge", reject: "Reject" },
   escalation: { label: "Stuck", approve: "Try again", reject: "Discard" },
   plan_revision: { label: "Plan change", approve: "Apply changes", reject: "Reject" },
-  spec_change: { label: "Spec change", approve: "Record in spec", reject: "Dismiss" },
+  spec_change: { label: "Spec change", approve: "Update the documents", reject: "Dismiss" },
   milestone: { label: "Milestone", approve: "Push & open PR", reject: "Not now" },
+  budget: { label: "Budget", approve: "Raise the cap", reject: "Pause project" },
+  coverage: { label: "Under-tested", approve: "Merge anyway", reject: "Back to the Tester" },
 };
 
 function GateCard({ g, onDone }: { g: Gate; onDone: () => void }) {
@@ -19,11 +21,11 @@ function GateCard({ g, onDone }: { g: Gate; onDone: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const a = ACTIONS[g.kind];
-  const decide = async (approve: boolean) => {
+  const decide = async (approve: boolean, action = "") => {
     setBusy(true);
     setError("");
     try {
-      await post(`/api/gates/${g.id}/resolve`, { approve, note });
+      await post(`/api/gates/${g.id}/resolve`, { approve, note, action });
       onDone();
     } catch (e) {
       setError((e as Error).message);
@@ -54,6 +56,16 @@ function GateCard({ g, onDone }: { g: Gate; onDone: () => void }) {
         <button className="btn" disabled={busy} onClick={() => decide(false)}>
           {a.reject}
         </button>
+        {g.kind === "escalation" && g.task_id && (
+          <button
+            className="btn"
+            disabled={busy}
+            title="The tests may be wrong or unclear: the Tester writes them again"
+            onClick={() => decide(true, "send_back")}
+          >
+            Back to the Tester
+          </button>
+        )}
         <button className="btn primary" disabled={busy} onClick={() => decide(true)}>
           {a.approve}
         </button>

@@ -1,27 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { patch, post, put } from "../api";
+import { post, put } from "../api";
 import { ActionButton, ErrorNote, fmtTime } from "../components";
 import { useEventStream, usePoll } from "../hooks";
 import type { DocName, Project, SpecState } from "../types";
 
 const DOCS: { name: DocName; label: string }[] = [
-  { name: "spec", label: "Spec" },
-  { name: "plan", label: "Plan" },
-  { name: "validation", label: "Validation" },
+  { name: "requirements", label: "Requirements" },
+  { name: "design", label: "Design" },
+  { name: "acceptance", label: "Acceptance criteria" },
   { name: "tasks", label: "Tasks" },
 ];
+const PLANNING: DocName[] = ["requirements", "design", "acceptance"];
 
 /** Live planner output for the active job, assembled from streamed events: the reply,
  * and the reasoning a thinking model streams before (or while) it writes one. */
 function usePlannerStream(projectId: number, jobId: number | undefined) {
   const { events } = useEventStream({ project_id: projectId });
   return useMemo(() => {
-    const out = { text: "", thinking: "" };
+    const out = { text: "", thinking: "", research: [] as string[] };
     if (jobId === undefined) return out;
     for (const e of events) {
       if (e.data.job_id !== jobId) continue;
       if (e.kind === "planner") out.text += e.message;
       else if (e.kind === "planner_thinking") out.thinking += e.message;
+      else if (e.kind === "research") out.research.push(e.message);
     }
     return out;
   }, [events, jobId]);
@@ -121,14 +123,15 @@ function Chat({ spec, project, reload }: { spec: SpecState; project: Project; re
   return (
     <section className="card chat">
       <h2>
-        Planner
+        Project Planning Agent
         {active && <span className="badge state-running">{active.kind === "chat" ? "thinking…" : "breaking down tasks…"}</span>}
       </h2>
       <div className="chat-log">
         {spec.messages.length === 0 && !active && (
           <div className="muted chat-empty">
-            Describe what you want to build. The planner will ask questions and draft the spec, plan, validation
-            criteria and acceptance tests with you.
+            Describe what you want to build. The planner asks questions, researches what it doesn't know, and
+            writes the requirements, design and acceptance criteria with you, in plain language. No code yet: the
+            Tester and Builder agents take it from there.
           </div>
         )}
         {spec.messages.map((m) => (
@@ -149,6 +152,13 @@ function Chat({ spec, project, reload }: { spec: SpecState; project: Project; re
         {active && (
           <div className="msg msg-assistant streaming">
             <div className="msg-meta">Planner · {active.model || "…"}</div>
+            {streaming.research.length > 0 && (
+              <div className="research small muted">
+                {streaming.research.map((r, i) => (
+                  <div key={i}>🔎 {r}</div>
+                ))}
+              </div>
+            )}
             <Thinking text={streaming.thinking} answering={!!streaming.text} />
             {(streaming.text || !streaming.thinking) && (
               <div className="msg-body">{summarizeStream(streaming.text) || "…"}</div>
@@ -165,7 +175,7 @@ function Chat({ spec, project, reload }: { spec: SpecState; project: Project; re
           disabled={!canChat}
           placeholder={
             spec.phase !== "specify"
-              ? "The spec is approved. Reopen it to keep talking."
+              ? "The documents are approved. Reopen them to keep talking."
               : active
                 ? "Waiting for the planner…"
                 : "Message the planner (Ctrl+Enter to send)"
@@ -184,7 +194,7 @@ function Chat({ spec, project, reload }: { spec: SpecState; project: Project; re
 }
 
 function Docs({ spec, project, reload }: { spec: SpecState; project: Project; reload: () => void }) {
-  const [tab, setTab] = useState<DocName>("spec");
+  const [tab, setTab] = useState<DocName>("requirements");
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState("");
   const editable = spec.phase === "specify" && tab !== "tasks" && !spec.active_job;
@@ -250,44 +260,23 @@ function Docs({ spec, project, reload }: { spec: SpecState; project: Project; re
 }
 
 function Approve({ spec, project, reload }: { spec: SpecState; project: Project; reload: () => void }) {
-  const [cmd, setCmd] = useState(spec.acceptance_cmd);
   const [error, setError] = useState("");
-  useEffect(() => setCmd(spec.acceptance_cmd), [spec.acceptance_cmd]);
-  const missing = (["spec", "plan", "validation"] as DocName[]).filter((d) => !spec.docs[d].trim());
+  const missing = PLANNING.filter((d) => !spec.docs[d].trim()).map((d) => DOCS.find((x) => x.name === d)?.label);
 
   return (
     <section className="card approve">
       <h2>Definition of done</h2>
-      <label className="field">
-        <span className="field-label">Acceptance command</span>
-        <div className="row">
-          <input
-            className="mono grow"
-            value={cmd}
-            disabled={spec.phase !== "specify"}
-            placeholder="e.g. pytest -q tests/acceptance"
-            onChange={(e) => setCmd(e.target.value)}
-          />
-          {cmd !== spec.acceptance_cmd && (
-            <ActionButton
-              onClick={async () => {
-                await patch(`/api/projects/${project.id}`, { acceptance_cmd: cmd });
-                reload();
-              }}
-            >
-              Save
-            </ActionButton>
-          )}
-        </div>
-        <span className="field-hint">The project is done when this passes. The planner usually proposes it.</span>
-      </label>
+      <p className="small">
+        The acceptance criteria are the definition of done. Once you approve the documents, the Task Planning Agent
+        breaks the work into tasks, and the Tester Agent turns the criteria into acceptance tests.
+      </p>
       {spec.phase === "specify" && (
         <>
           {missing.length > 0 && <div className="small muted">Still missing: {missing.join(", ")}.</div>}
           <ErrorNote error={error} />
           <ActionButton
             kind="primary"
-            disabled={missing.length > 0 || !spec.acceptance_cmd || !!spec.active_job}
+            disabled={missing.length > 0 || !!spec.active_job}
             onClick={async () => {
               setError("");
               try {
@@ -298,14 +287,12 @@ function Approve({ spec, project, reload }: { spec: SpecState; project: Project;
               }
             }}
           >
-            Approve spec &amp; break into tasks
+            Approve documents &amp; break into tasks
           </ActionButton>
         </>
       )}
       {spec.phase === "decomposing" && (
-        <div className="small">
-          Spec approved. The planner is breaking the plan into tasks sized for the executor model…
-        </div>
+        <div className="small">Approved. The Task Planning Agent is breaking the work into tasks…</div>
       )}
     </section>
   );

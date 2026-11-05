@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from foreman import images
 from foreman.core.models import TaskState
 from foreman.orchestrator.main import Orchestrator
@@ -54,3 +56,43 @@ async def test_local_runtime_ignores_the_dockerfile(client, origin, tmp_path):
     t = make_task(client, p["id"], "echo hi > out.txt", validation="test -f out.txt")
     await drive(Orchestrator(), lambda: task(t["id"]).state in TERMINAL)
     assert task(t["id"]).state == TaskState.DONE, task(t["id"]).reason
+
+
+def test_must_build_from_the_executor_base():
+    images.check_dockerfile("FROM foreman/executor-base:latest\nRUN true\n")
+    images.check_dockerfile(
+        "FROM node:22 AS build\nRUN x\nFROM foreman/executor-base\nCOPY --from=build /a /a\n"
+    )
+    with pytest.raises(images.ImageBuildError, match="must build FROM foreman/executor-base"):
+        images.check_dockerfile("FROM ubuntu:24.04\n")
+    with pytest.raises(images.ImageBuildError, match="no FROM"):
+        images.check_dockerfile("RUN true\n")
+
+
+def test_copy_sources():
+    text = (
+        "FROM foreman/executor-base\n"
+        "COPY requirements.txt /tmp/\n"
+        "COPY --chown=1000 pyproject.toml uv.lock /app/\n"
+        "COPY --from=build /x /y\n"
+        'ADD ["setup.cfg", "/app/"]\n'
+    )
+    assert images.copy_sources(text) == [
+        "requirements.txt",
+        "pyproject.toml",
+        "uv.lock",
+        "setup.cfg",
+    ]
+
+
+def test_copied_files_change_the_tag(tmp_path):
+    ctx = tmp_path / ".foreman"
+    ctx.mkdir()
+    dockerfile = "FROM foreman/executor-base\nCOPY requirements.txt /tmp/\n"
+    (ctx / "requirements.txt").write_text("httpx\n")
+    (ctx / "notes.txt").write_text("x\n")
+    a = images.image_tag(1, dockerfile, "sha256:a", images._sources_digest(ctx, dockerfile))
+    (ctx / "notes.txt").write_text("y\n")  # not copied in: same image
+    assert a == images.image_tag(1, dockerfile, "sha256:a", images._sources_digest(ctx, dockerfile))
+    (ctx / "requirements.txt").write_text("httpx\nrich\n")
+    assert a != images.image_tag(1, dockerfile, "sha256:a", images._sources_digest(ctx, dockerfile))

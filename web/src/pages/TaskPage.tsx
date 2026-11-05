@@ -3,9 +3,149 @@ import { Link, useParams } from "react-router-dom";
 import { control, post } from "../api";
 import { ActionButton, ErrorNote, EventLog, StateBadge, StopButton, fmtDuration, fmtTime } from "../components";
 import { useEventStream, usePoll } from "../hooks";
-import type { Project, Task } from "../types";
+import type { Project, Task, TestCase, TestRun } from "../types";
 
-type Tab = "log" | "diff" | "details";
+type Tab = "log" | "tests" | "diff" | "details";
+
+const STEP_LABEL: Record<string, string> = { tester: "Tester", builder: "Builder", acceptance: "Acceptance" };
+
+export function pct(n: number | null | undefined) {
+  return n == null ? "—" : `${Math.round(n)}%`;
+}
+
+export function CaseList({ cases, onlyTask = false }: { cases: TestCase[]; onlyTask?: boolean }) {
+  const shown = onlyTask ? cases.filter((c) => c.task_test) : cases;
+  const order = { failed: 0, error: 1, skipped: 2, passed: 3 };
+  const sorted = shown.slice().sort((a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name));
+  if (!sorted.length) return <p className="muted small">No test cases reported.</p>;
+  return (
+    <table className="cases small">
+      <thead>
+        <tr><th>Result</th><th>Test</th><th>File</th><th>Time</th></tr>
+      </thead>
+      <tbody>
+        {sorted.map((c) => (
+          <tr key={c.id} className={`case-${c.status}`}>
+            <td>
+              <span className={`badge test-${c.status}`}>{c.status === "passed" ? "✓ passed" : c.status === "skipped" ? "skipped" : "✗ " + c.status}</span>
+            </td>
+            <td>
+              <span className="mono">{c.name}</span>
+              {c.task_test && !onlyTask && <span className="badge kind-badge">this task</span>}
+              {c.message && <div className="case-message mono">{c.message}</div>}
+            </td>
+            <td className="mono muted">{c.file || c.classname}</td>
+            <td className="muted">{c.duration_s ? `${c.duration_s.toFixed(2)}s` : ""}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+export function RunSummary({ run }: { run: TestRun }) {
+  const failing = run.failed + run.errors;
+  return (
+    <div className="test-summary">
+      <div className="stat">
+        <div className={`stat-value ${failing ? "bad" : "ok-text"}`}>{run.passed} / {run.passed + failing}</div>
+        <div className="stat-label">tests passing</div>
+      </div>
+      <div className="stat">
+        <div className="stat-value">{pct(run.coverage)}</div>
+        <div className="stat-label">line coverage</div>
+      </div>
+      {run.step === "builder" && (
+        <div className="stat">
+          <div className="stat-value">{pct(run.changed_coverage)}</div>
+          <div className="stat-label">of changed lines covered{run.changed_lines ? ` (${run.changed_lines})` : ""}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TestsView({ taskId, live }: { taskId: number; live: boolean }) {
+  const { data, error } = usePoll<{ runs: TestRun[] }>(`/api/tasks/${taskId}/tests`, live ? 3000 : 30000);
+  if (error) return <ErrorNote error={error} />;
+  if (!data) return <div className="muted">Loading…</div>;
+  if (!data.runs.length) return <div className="muted">No test results yet. The Tester writes this task's tests first.</div>;
+  const latest = data.runs[0];
+  const files = Object.entries(latest.files);
+  return (
+    <div className="tests-view">
+      <h3>
+        Latest run: {STEP_LABEL[latest.step]} step <span className="muted small">{fmtTime(latest.created_at)}</span>
+      </h3>
+      {latest.problem && <div className="error-note">{latest.problem}</div>}
+      <RunSummary run={latest} />
+      <h3>This task's tests</h3>
+      <CaseList cases={latest.cases ?? []} onlyTask />
+      <details>
+        <summary className="small">Whole suite ({(latest.cases ?? []).length} tests)</summary>
+        <CaseList cases={latest.cases ?? []} />
+      </details>
+      {files.length > 0 && (
+        <details>
+          <summary className="small">Coverage by file</summary>
+          <table className="cases small">
+            <thead><tr><th>File</th><th>Covered</th><th>Lines</th><th></th></tr></thead>
+            <tbody>
+              {files.map(([f, v]) => (
+                <tr key={f}>
+                  <td className="mono">{f}</td>
+                  <td>{v.covered}</td>
+                  <td>{v.total}</td>
+                  <td>{pct(v.total ? (100 * v.covered) / v.total : null)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+      <h3>History</h3>
+      <table className="cases small">
+        <thead><tr><th>When</th><th>Step</th><th>Passed</th><th>Failed</th><th>Coverage</th><th>Changed lines</th></tr></thead>
+        <tbody>
+          {data.runs.map((r) => (
+            <tr key={r.id}>
+              <td>{fmtTime(r.created_at)}</td>
+              <td>{STEP_LABEL[r.step]}{r.step === "tester" && <span className="muted"> (expected to fail)</span>}</td>
+              <td>{r.passed}</td>
+              <td className={r.failed + r.errors ? "warn" : ""}>{r.failed + r.errors}</td>
+              <td>{pct(r.coverage)}</td>
+              <td>{r.step === "builder" ? pct(r.changed_coverage) : ""}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Where the task is in Tester -> Builder. */
+function Pipeline({ t }: { t: Task }) {
+  if (!t.criteria.length) return null;
+  const last = t.runs?.[t.runs.length - 1];
+  const building = t.tests_ready;
+  const step = (name: "tester" | "builder", label: string) => {
+    const done = name === "tester" ? t.tests_ready : t.state === "done";
+    const now = last?.step === name && (t.state === "running" || t.state === "validating");
+    return <span className={`pipe-step ${done ? "done" : ""} ${now ? "now" : ""}`}>{label}</span>;
+  };
+  return (
+    <div className="pipeline small">
+      {step("tester", t.kind === "acceptance" ? "Tester writes the acceptance tests" : "Tester writes tests")}
+      {t.kind !== "acceptance" && (
+        <>
+          <span className="muted">→</span>
+          {step("builder", building ? "Builder makes them pass" : "Builder")}
+        </>
+      )}
+      {t.coverage_rounds > 0 && <span className="muted">· sent back once for coverage</span>}
+    </div>
+  );
+}
 
 function DiffView({ taskId, live }: { taskId: number; live: boolean }) {
   const { data, error } = usePoll<{ diff: string; files: string[] }>(`/api/tasks/${taskId}/diff`, live ? 3000 : 60000);
@@ -44,23 +184,33 @@ function Details({ t }: { t: Task }) {
     <div className="details">
       {t.description && (
         <>
-          <h3>Description</h3>
+          <h3>Goal</h3>
           <p className="pre">{t.description}</p>
         </>
       )}
-      {t.todos.length > 0 && (
+      {t.criteria.length > 0 && (
         <>
-          <h3>Todos</h3>
-          <ul>{t.todos.map((x, i) => <li key={i}>{x}</li>)}</ul>
+          <h3>Done when</h3>
+          <ul>{t.criteria.map((x, i) => <li key={i}>{x}</li>)}</ul>
         </>
       )}
-      <h3>Done when</h3>
-      <pre className="mono block">{t.validation_cmd}</pre>
-      <h3>Allowed files</h3>
-      {t.allowed_globs.length ? (
-        <ul className="mono">{t.allowed_globs.map((g) => <li key={g}>{g}</li>)}</ul>
-      ) : (
-        <p className="muted">Unrestricted</p>
+      {t.req_refs.length > 0 && (
+        <>
+          <h3>Implements</h3>
+          <p>{t.req_refs.join(", ")}</p>
+        </>
+      )}
+      {t.validation_cmd && (
+        <>
+          <h3>Check (scripted task)</h3>
+          <pre className="mono block">{t.validation_cmd}</pre>
+        </>
+      )}
+      {t.allowed_globs.length > 0 && (
+        <>
+          <h3>Allowed files</h3>
+          <ul className="mono">{t.allowed_globs.map((g) => <li key={g}>{g}</li>)}</ul>
+        </>
       )}
       {t.deps.length > 0 && (
         <>
@@ -71,12 +221,13 @@ function Details({ t }: { t: Task }) {
       <h3>Runs</h3>
       <table className="runs">
         <thead>
-          <tr><th>#</th><th>State</th><th>Started</th><th>Duration</th><th>Model</th><th>Calls</th><th>Tokens</th><th>Reason</th></tr>
+          <tr><th>#</th><th>Agent</th><th>State</th><th>Started</th><th>Duration</th><th>Model</th><th>Calls</th><th>Tokens</th><th>Reason</th></tr>
         </thead>
         <tbody>
           {(t.runs ?? []).slice().reverse().map((r) => (
             <tr key={r.id}>
               <td>{r.id}</td>
+              <td>{r.step ? STEP_LABEL[r.step] : "—"}</td>
               <td>{r.state}</td>
               <td>{fmtTime(r.started_at)}</td>
               <td>{fmtDuration(r.started_at, r.ended_at)}</td>
@@ -173,6 +324,7 @@ export default function TaskPage() {
             {t.hold && <span className="warn"> · on hold (will park after current step)</span>}
           </div>
           {t.reason && t.state !== "done" && <div className="reason">{t.reason}</div>}
+          <Pipeline t={t} />
           {t.parent_id && (
             <div className="small muted">
               split from <Link to={`/tasks/${t.parent_id}`}>#{t.parent_id}</Link>
@@ -220,15 +372,16 @@ export default function TaskPage() {
 
       <Watchdog t={t} />
       <div className="tabs">
-        {(["log", "diff", "details"] as Tab[]).map((x) => (
+        {(["log", "tests", "diff", "details"] as Tab[]).map((x) => (
           <button key={x} className={tab === x ? "active" : ""} onClick={() => setTab(x)}>
-            {x === "log" ? "Live log" : x === "diff" ? "Diff" : "Details"}
+            {{ log: "Live log", tests: "Tests", diff: "Diff", details: "Details" }[x]}
           </button>
         ))}
         <span className={`dot ${connected ? "ok" : "bad"}`}>{connected ? "live" : "reconnecting"}</span>
       </div>
       <section className="card">
         {tab === "log" && <EventLog events={events} empty="Waiting for the agent…" />}
+        {tab === "tests" && <TestsView taskId={id} live={active} />}
         {tab === "diff" && <DiffView taskId={id} live={active} />}
         {tab === "details" && <Details t={t} />}
       </section>

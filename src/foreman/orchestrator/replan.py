@@ -1,5 +1,6 @@
-"""Replanning (FR-6): after each completed task, a reviewer model checks that the
-plan still leads to the goal and proposes changes to the remaining tasks.
+"""Replanning (FR-6): after each completed task, the Task Planning Agent checks that
+the plan still leads to the goal and proposes changes to the remaining tasks, in
+plain language (it sees the task's goal, criteria and test results, not code).
 
 The reviewer answers with a JSON object::
 
@@ -12,10 +13,13 @@ The reviewer answers with a JSON object::
 Rules enforced here, not just asked for:
 - only tasks that haven't started (queued / proposed / blocked) can be changed;
 - every op needs a reason;
-- added or modified tasks must pass the same size checks as the original plan;
+- added or modified tasks must pass the same checks as the original plan (plain
+  language, criteria, size);
 - tasks added by replanning are capped at ``growth_cap_pct`` of the approved
   plan; beyond that the revision waits for approval;
-- spec changes are never applied automatically (a checkpoint, always on);
+- spec changes are never applied automatically (a checkpoint, always on); once
+  approved, the Project Planning Agent edits the documents (the Task Planner
+  can't write them);
 - with the ``replan_approval`` checkpoint on, every non-empty revision waits.
 
 Every revision is recorded (PlanRevision) and tasks.md is re-rendered.
@@ -30,9 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlmodel import col, select
 
-from foreman import gitops
-from foreman.core import gates, watchdog
-from foreman.core.contextpack import budget_tokens, repo_files
+from foreman.core import gates, roles, watchdog
 from foreman.core.models import (
     GateKind,
     JobKind,
@@ -42,26 +44,29 @@ from foreman.core.models import (
     PlanRevision,
     Project,
     RevisionState,
+    SpecMessage,
     Task,
     TaskState,
+    TestRun,
 )
 from foreman.core.state import emit, transition
 from foreman.db import session
-from foreman.planner import PlanError, TaskSpec, doc_path, parse_tasks, retry_message
+from foreman.planner import (
+    CODE_FIELDS,
+    PLAIN_LANGUAGE,
+    TASK_RULES,
+    PlanError,
+    TaskSpec,
+    doc_path,
+    parse_task_items,
+    retry_message,
+)
 
 if TYPE_CHECKING:
     from foreman.orchestrator.jobs import JobRunner
 
 MODIFIABLE = (TaskState.QUEUED, TaskState.PROPOSED, TaskState.BLOCKED)
-EDITABLE_FIELDS = (
-    "title",
-    "description",
-    "todos",
-    "allowed_files",
-    "context_files",
-    "validation_cmd",
-    "req_refs",
-)
+EDITABLE_FIELDS = ("title", "goal", "criteria", "req_refs")
 
 
 def queue_review(
@@ -72,7 +77,7 @@ def queue_review(
         project = s.get(Project, project_id)
         if project is None or not watchdog.limit(project, "replan"):
             return False
-        if not ((project.role_bindings or {}).get("planner") or {}).get("node_id"):
+        if not roles.binding(project, roles.TASK_PLANNER):
             return False
         waiting = s.exec(
             select(PlannerJob).where(
@@ -101,8 +106,6 @@ def review_system_prompt(
     tasks: list[Task],
     trigger: str,
     evidence: str,
-    budget: int,
-    tree: list[str],
 ) -> str:
     keys = {t.id: t.key or f"#{t.id}" for t in tasks}
     table = [
@@ -110,52 +113,47 @@ def review_system_prompt(
             "key": keys[t.id],
             "state": t.state.value,
             "title": t.title,
-            "allowed_files": t.allowed_globs,
+            "goal": t.description,
+            "criteria": t.criteria,
             "deps": [keys.get(d, d) for d in t.deps],
-            "validation_cmd": t.validation_cmd,
             "req_refs": t.req_refs,
+            **({"kind": t.kind} if t.kind != "feature" else {}),
         }
         for t in tasks
     ]
-    d = f"specs/{project.feature}"
+    sections: list[str] = []
+    for key in roles.PLANNING_DOCS:
+        sections += ["", f"## {doc_path(project, key)}", docs.get(key, "").strip() or "(empty)"]
     return "\n".join(
         [
-            "You review the plan of a software project while coding agents work through it. "
-            f"Something just happened: {trigger}. Decide whether the remaining tasks still lead to "
-            "the goal (all acceptance tests passing) and propose the SMALLEST changes needed. "
-            "If the plan is on track, return no ops.",
+            "You are the Task Planning Agent, reviewing the plan while the Tester and Builder "
+            f"agents work through it. Something just happened: {trigger}. Decide whether the "
+            "remaining tasks still make every acceptance criterion true and propose the "
+            "SMALLEST changes needed. If the plan is on track, return no ops.",
+            PLAIN_LANGUAGE,
             "",
             "Answer with ONLY a JSON object:",
             '{"summary": "one sentence", "ops": [...], "spec_change": null}',
             "Ops:",
-            '- {"op": "add", "task": {"key": "T9", "title": "...", "description": "...", '
-            '"req_refs": [], "todos": [], "allowed_files": ["..."], "context_files": [], '
-            '"validation_cmd": "...", "deps": ["T3"]}, "reason": "..."}',
+            '- {"op": "add", "task": {"key": "T9", "title": "...", "goal": "...", '
+            '"req_refs": [], "criteria": ["..."], "deps": ["T3"], "size": "small"}, '
+            '"reason": "..."}',
             '- {"op": "remove", "key": "T5", "reason": "..."}',
-            '- {"op": "modify", "key": "T6", "changes": {"description": "..."}, "reason": "..."}',
-            "Only tasks in state queued, proposed or blocked can be removed or modified. "
-            "Every op needs a reason.",
-            f"New tasks change at most {project.max_task_files} files (listed explicitly) and fit "
-            f"in about {budget} tokens of context.",
-            'If the SPEC itself is wrong or incomplete, set "spec_change": {"reason": "...", '
-            '"proposal": "..."}: a person will decide.',
+            '- {"op": "modify", "key": "T6", "changes": {"goal": "...", "criteria": ["..."]}, '
+            '"reason": "..."}',
+            "Only tasks in state queued, proposed or blocked can be removed or modified, and "
+            f"only their {', '.join(EDITABLE_FIELDS)}. Every op needs a reason.",
+            *TASK_RULES[1:],
+            'If the planning documents themselves are wrong or incomplete, set "spec_change": '
+            '{"reason": "...", "proposal": "..."} in plain language: a person decides, and the '
+            "Project Planning Agent updates the documents.",
             "",
             "## What happened",
             evidence.strip() or "(no details)",
             "",
             "## Tasks",
             json.dumps(table, indent=1),
-            "",
-            f"## {d}/spec.md",
-            docs.get("spec", "").strip() or "(empty)",
-            "",
-            f"## {d}/plan.md",
-            docs.get("plan", "").strip() or "(empty)",
-            "",
-            f"Acceptance command: {project.acceptance_cmd or '(not set)'}",
-            "",
-            "## Repository files",
-            *(tree[:200] or ["(empty)"]),
+            *sections,
         ]
     )
 
@@ -217,9 +215,13 @@ def validate_ops(
                 continue
             entry: dict[str, Any] = {"op": kind, "key": key, "reason": reason}
             if kind == "modify":
-                changes = {
-                    k: v for k, v in (op.get("changes") or {}).items() if k in EDITABLE_FIELDS
-                }
+                raw = op.get("changes") or {}
+                code = [f for f in CODE_FIELDS if f in raw]
+                if code:
+                    problems.append(
+                        f"op {i}: tasks don't name {', '.join(code)}; change the goal or criteria"
+                    )
+                changes = {k: v for k, v in raw.items() if k in EDITABLE_FIELDS}
                 if not changes:
                     problems.append(f"op {i}: modify of {key} changes nothing editable")
                     continue
@@ -229,12 +231,9 @@ def validate_ops(
             problems.append(f"op {i}: unknown op {kind!r}")
     specs: list[TaskSpec] = []
     if added:
-        # Validate new tasks as a plan of their own; deps may point at existing tasks.
-        stub_keys = [k for k in by_key if k not in {a.get("key") for a in added}]
-        stubs = [{"key": k, "title": "existing", "deps": []} for k in stub_keys]
+        # New tasks pass the same checks as a plan; deps may point at existing tasks.
         try:
-            parsed = parse_tasks(json.dumps(stubs + added))
-            specs = [p for p in parsed if p.key not in stub_keys]
+            specs = parse_task_items(added, known=tuple(by_key))
         except PlanError as e:
             problems.append(str(e))
     if problems:
@@ -264,22 +263,8 @@ async def run_review(job: JobRunner, node: Node, model: str) -> None:
     if job.task_id is not None:
         done = next((t for t in tasks if t.id == job.task_id), None)
         if done is not None:
-            diff = gitops.diff(gitops.task_dir(project.id, job.task_id))[:6000]
-            evidence = (
-                f"Task {done.key}: {done.title} is done.\n"
-                f"Its changes:\n{diff or '(no diff available)'}\n{evidence}"
-            )
-    docs = read_docs(project)
-    window = job._executor_window(project)
-    system = review_system_prompt(
-        project,
-        docs,
-        tasks,
-        trigger,
-        evidence,
-        budget_tokens(project, window),
-        repo_files(gitops.repo_dir(project.id)),
-    )
+            evidence = f"{task_summary(done)}\n{evidence}"
+    system = review_system_prompt(project, read_docs(project), tasks, trigger, evidence)
     messages = [{"role": "user", "content": "Review the plan now."}]
     data: dict[str, Any] = {}
     ops: list[dict[str, Any]] = []
@@ -289,11 +274,6 @@ async def run_review(job: JobRunner, node: Node, model: str) -> None:
         try:
             data = extract_json_object(text)
             ops, specs = validate_ops(data, tasks)
-            violations, _ = job._check_sizes(project, specs, window)
-            if violations:
-                raise PlanError(
-                    "; ".join(f"task {k}: {', '.join(v)}" for k, v in violations.items())
-                )
             break
         except PlanError as e:
             if attempt == 1:
@@ -308,6 +288,21 @@ async def run_review(job: JobRunner, node: Node, model: str) -> None:
     if not finish_job(job.job_id, (JobState.RUNNING,), JobState.DONE):
         return
     record_revision(project, trigger, data, ops)
+
+
+def task_summary(task: Task) -> str:
+    """What the Task Planner learns about a finished task: plain facts, no code."""
+    lines = [f"Task {task.key or task.id}: {task.title} is done."]
+    if task.criteria:
+        lines += ["Its criteria:", *[f"- {c}" for c in task.criteria]]
+    with session() as s:
+        result = s.exec(
+            select(TestRun).where(TestRun.task_id == task.id).order_by(col(TestRun.id).desc())
+        ).first()
+    if result is not None:
+        cov = f", {result.coverage:.0f}% coverage" if result.coverage is not None else ""
+        lines.append(f"Tests: {result.passed} passed, {result.failed + result.errors} failed{cov}.")
+    return "\n".join(lines)
 
 
 def record_revision(
@@ -392,7 +387,8 @@ def record_revision(
             GateKind.SPEC_CHANGE,
             "The reviewer proposes a spec change",
             f"Why: {spec_change.get('reason', '')}\n\nProposal:\n{spec_change.get('proposal', '')}"
-            "\n\nApprove to record it in spec.md; the plan is not changed automatically.",
+            "\n\nApprove to have the Project Planning Agent update the planning documents; "
+            "the plan is not changed automatically.",
             payload={"revision_id": rev.id, **spec_change},
         )
     return rev
@@ -429,12 +425,9 @@ def apply_revision(revision_id: int) -> None:
                     project_id=rev.project_id,
                     key=op["key"],
                     title=str(t.get("title", "")),
-                    description=str(t.get("description", "")),
-                    todos=list(t.get("todos") or []),
+                    description=str(t.get("goal") or t.get("description") or ""),
+                    criteria=[str(c) for c in (t.get("criteria") or [])],
                     req_refs=list(t.get("req_refs") or []),
-                    allowed_globs=list(t.get("allowed_files") or []),
-                    context_files=list(t.get("context_files") or []),
-                    validation_cmd=str(t.get("validation_cmd", "")),
                     deps=[d.id for k in (t.get("deps") or []) if (d := by_key.get(k)) and d.id],
                     origin="replan",
                     state=TaskState.QUEUED,
@@ -463,7 +456,7 @@ def apply_revision(revision_id: int) -> None:
                 if current is None or current.state not in MODIFIABLE:
                     continue
                 for k, v in op.get("changes", {}).items():
-                    setattr(current, "allowed_globs" if k == "allowed_files" else k, v)
+                    setattr(current, "description" if k == "goal" else k, v)
                 s.add(current)
                 s.commit()
             emit(rev.project_id, t.id, "replan", f"modified {op['key']}: {op['reason']}")
@@ -485,14 +478,27 @@ def reject_revision(revision_id: int) -> None:
             s.commit()
 
 
-def record_spec_change(project_id: int, payload: dict[str, Any]) -> None:
-    """Append an approved spec change to spec.md (the user can edit it further)."""
+def apply_spec_change(project_id: int, payload: dict[str, Any]) -> None:
+    """An approved spec change: the Project Planning Agent updates the documents."""
+    proposal = str(payload.get("proposal", "")).strip()
+    reason = str(payload.get("reason", "")).strip()
     with session() as s:
-        project = s.get(Project, project_id)
-        assert project is not None
-    path = doc_path(project, "spec")
-    spec = gitops.read_repo_file(project_id, path).rstrip()
-    heading = "## Changes approved during execution"
-    entry = f"- {payload.get('proposal', '').strip()} (why: {payload.get('reason', '').strip()})"
-    spec = f"{spec}\n\n{entry}\n" if heading in spec else f"{spec}\n\n{heading}\n\n{entry}\n"
-    gitops.write_and_commit(project_id, {path: spec}, "spec: record approved change")
+        s.add(
+            SpecMessage(
+                project_id=project_id,
+                role="user",
+                content=(
+                    "An approved change from the plan review. Update the planning documents "
+                    f"to include it, keeping them consistent.\n\nChange: {proposal}\n\n"
+                    f"Why: {reason}"
+                ),
+            )
+        )
+        s.add(PlannerJob(project_id=project_id, kind=JobKind.CHAT))
+        s.commit()
+    emit(
+        project_id,
+        None,
+        "replan",
+        "spec change approved; the Project Planning Agent updates the documents",
+    )

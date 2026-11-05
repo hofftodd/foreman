@@ -45,7 +45,17 @@ async def test_anthropic_request_shape(llm):
     assert req["model"] == "claude-opus-5-5"
     assert req["thinking"] == {"type": "adaptive"}
     assert req["fallbacks"] == "default"
-    assert req["system"] == "S" and req["stream"] is True
+    assert req["output_config"] == {"effort": "high"}
+    assert req["system"] == "S" and req["stream"] is True and req["max_tokens"] == 64000
+
+
+async def test_haiku_gets_effort_but_no_server_side_fallback(llm):
+    node = Node(
+        name="claude", provider="anthropic", base_url=llm.url.removesuffix("/v1"), api_key="k"
+    )
+    await stream_chat(node, "claude-haiku-5-5", "S", [{"role": "user", "content": "x"}])
+    req = llm.requests[-1]
+    assert req["output_config"] == {"effort": "high"} and "fallbacks" not in req
 
 
 async def test_abort_closes_the_stream(llm):
@@ -89,9 +99,14 @@ async def test_list_models(llm, provider):
     from foreman.llm import list_models
 
     base = llm.url if provider == "openai" else llm.url.removesuffix("/v1")
-    assert await list_models(Node(name="n", provider=provider, base_url=base, api_key="k")) == [
-        "fake-coder"
-    ]
+    expected = (
+        ["fake-coder"]
+        if provider == "openai"
+        else ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+    )
+    assert await list_models(Node(name="n", provider=provider, base_url=base, api_key="k")) == (
+        expected
+    )
 
 
 def test_output_budget_uses_the_context_window():

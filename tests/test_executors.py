@@ -87,4 +87,4 @@ def test_budget_subtracts_executor_overhead():
     assert budget_tokens(p, 32000, "pi") == (32000 - 1500) // 2
     assert budget_tokens(p, 32000, "opencode") == (32000 - 7500) // 2
     assert budget_tokens(p, 32000, "pi") > budget_tokens(p, 32000, "opencode")
-    assert set(EXECUTORS) == {"pi", "opencode", "shell"}
+    assert set(EXECUTORS) == {"pi", "opencode", "aider", "shell"}

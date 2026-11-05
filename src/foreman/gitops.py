@@ -136,10 +136,35 @@ def changed_files(path: Path) -> list[str]:
     return sorted({f for f in (out + untracked).splitlines() if f})
 
 
-def diff_size(path: Path) -> int:
-    """Lines added + removed since the task started (committed changes)."""
+def head(path: Path) -> str:
+    return _read("rev-parse", "HEAD", cwd=path).strip()
+
+
+def has_commit(path: Path, sha: str) -> bool:
+    return bool(sha) and bool(_read("cat-file", "-t", sha, cwd=path).strip() == "commit")
+
+
+def changed_since(path: Path, base: str) -> list[str]:
+    """Files changed between `base` and HEAD."""
+    return sorted(f for f in _read("diff", "--name-only", base, "HEAD", cwd=path).splitlines() if f)
+
+
+def reset_to(path: Path, sha: str) -> None:
+    """Throw away commits and changes after `sha` (an agent stepped outside its role)."""
+    git("reset", "-q", "--hard", sha, cwd=path)
+    git("clean", "-q", "-fd", cwd=path)
+
+
+def clean_tree(path: Path) -> None:
+    """Drop anything a test run left behind (caches, outputs) so it is never committed."""
+    git("checkout", "-q", "--", ".", cwd=path, check=False)
+    git("clean", "-q", "-fd", cwd=path, check=False)
+
+
+def diff_size(path: Path, base: str = BASE_REF) -> int:
+    """Lines added + removed since `base` (the task start by default; committed changes)."""
     total = 0
-    for line in _read("diff", "--numstat", BASE_REF, cwd=path).splitlines():
+    for line in _read("diff", "--numstat", base, cwd=path).splitlines():
         added, removed, *_ = line.split("\t")
         if added.isdigit() and removed.isdigit():  # "-" for binary files
             total += int(added) + int(removed)
@@ -187,6 +212,34 @@ def merge_task(project_id: int, task_id: int, title: str) -> None:
     if proc.returncode != 0:
         git("merge", "--abort", cwd=repo, check=False)
         raise GitError(f"merge conflict: {proc.stdout.strip()} {proc.stderr.strip()}")
+
+
+def recover_repo(project_id: int, milestone_branch: str) -> list[str]:
+    """After a crash: put the main clone back into a clean state on the milestone branch.
+
+    Only the orchestrator writes here, so anything half-done is its own interrupted work:
+    a merge (aborted - the task merges again), a stale lock, uncommitted files from a
+    planner write (dropped - the job is re-run).
+    """
+    repo = repo_dir(project_id)
+    if not (repo / ".git").is_dir():
+        return []
+    done: list[str] = []
+    lock = repo / ".git" / "index.lock"
+    if lock.exists():
+        lock.unlink(missing_ok=True)
+        done.append("removed a stale git lock")
+    if (repo / ".git" / "MERGE_HEAD").exists():
+        git("merge", "--abort", cwd=repo, check=False)
+        done.append("aborted an interrupted merge")
+    current = git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo, check=False).strip()
+    if current != milestone_branch:
+        git("checkout", "--quiet", "--force", milestone_branch, cwd=repo, check=False)
+        done.append(f"switched back to {milestone_branch}")
+    if git("status", "--porcelain", "--untracked-files=no", cwd=repo, check=False).strip():
+        git("reset", "--quiet", "--hard", "HEAD", cwd=repo, check=False)
+        done.append("discarded uncommitted changes")
+    return done
 
 
 def push(project_id: int, repo_url: str, branch: str) -> None:

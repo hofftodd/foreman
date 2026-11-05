@@ -58,6 +58,11 @@ def _engine_for(path: str, control: bool) -> Engine:
     tables = CONTROL_TABLES if control else _main_tables()
     SQLModel.metadata.create_all(engine, tables=tables)
     _add_missing_columns(engine, tables)
+    if not control:
+        with engine.begin() as conn:  # "gateway" was the earlier name for "isolated"
+            conn.exec_driver_sql(
+                "UPDATE project SET network = 'isolated' WHERE network = 'gateway'"
+            )
     return engine
 
 

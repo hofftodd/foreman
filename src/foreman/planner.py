@@ -1,27 +1,27 @@
-"""The planner role: Phase 1 conversation and plan decomposition.
+"""The two planning agents (see core/roles.py), as pure functions over text.
 
-Both are pure functions over text so they can be tested without a model:
+- The **Project Planning Agent** works out the project with the user and writes the
+  planning documents (requirements, design, acceptance criteria): human-readable
+  markdown, no code. It writes them by emitting blocks::
 
-- the *chat* protocol lets the planner write documents by emitting blocks::
-
-      <<<FILE specs/001-initial/spec.md
+      <<<FILE specs/001-initial/requirements.md
       ...complete file content...
-      >>>
-
-      <<<ACCEPTANCE_CMD
-      pytest -q tests/acceptance
       >>>
 
   Full-file blocks (not diffs) are deliberately simple so small local models
   can follow them reliably. The parser is lenient about the variations local
   models produce: the path may be on the line after ``<<<FILE``, and a block
-  may end at the next ``<<<FILE``/``<<<ACCEPTANCE_CMD`` instead of ``>>>`` (a
-  bare ``<<<FILE`` followed by a blank line is then only a terminator). A
-  block still open when the reply ends is not applied: the reply was cut off.
+  may end at the next ``<<<FILE`` instead of ``>>>`` (a bare ``<<<FILE``
+  followed by a blank line is then only a terminator). A block still open when
+  the reply ends is not applied: the reply was cut off. Writes to anything but
+  the planning documents are refused.
 
-- *decomposition* asks for a JSON array of tasks, validates it (fields,
-  dependency graph, size limits via context packs) and returns a list of
-  problems to send back to the planner when it needs another try.
+- The **Task Planning Agent** breaks the documents into tasks, in plain language
+  (goal, acceptance criteria, requirement ids, dependencies, size): no files and
+  no commands, which the Tester and Builder work out. Its JSON is validated
+  (fields, dependency graph, size) and problems are sent back for another try.
+  Foreman adds the standard tasks every project gets (setup, acceptance tests,
+  documentation).
 """
 
 from __future__ import annotations
@@ -31,27 +31,33 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from foreman.core import roles
 from foreman.core.models import Project
 
-DOC_NAMES = ("spec", "plan", "validation", "tasks")
+DOC_NAMES = tuple(roles.DOCS)  # requirements, design, acceptance, tasks
 
 _FILE_OPEN = re.compile(r"^<<<FILE(?:[ \t]+(.*?))?[ \t]*$")
 _CMD_OPEN = re.compile(r"^<<<ACCEPTANCE_CMD[ \t]*$")
 _CLOSE = ">>>"
 
 
+def _exists(project: Project):  # type: ignore[no-untyped-def]
+    if project.id is None:
+        return None
+    from foreman.gitops import repo_dir
+
+    root = repo_dir(project.id)
+    return lambda rel: (root / rel).is_file()
+
+
 def doc_path(project: Project, name: str) -> str:
-    return f"specs/{project.feature}/{name}.md"
+    """Path of a planning document (older projects keep their original file names)."""
+    return roles.doc_file(project, name, _exists(project))
 
 
 def writable(project: Project, rel: str) -> bool:
-    """Paths the planner may write: the spec docs, acceptance tests, toolchain image."""
-    spec_dir = f"specs/{project.feature}/"
-    return (
-        (rel.startswith(spec_dir) and rel.endswith(".md") and "/" not in rel[len(spec_dir) :])
-        or rel.startswith("tests/acceptance/")
-        or rel == ".foreman/Dockerfile"
-    )
+    """The Project Planner writes the three planning documents and nothing else."""
+    return roles.planner_may_write(project, rel, _exists(project))
 
 
 @dataclass
@@ -59,7 +65,6 @@ class ChatOutput:
     message: str  # what the planner said, with file blocks replaced by notes
     files: dict[str, str] = field(default_factory=dict)
     rejected: list[str] = field(default_factory=list)
-    acceptance_cmd: str | None = None
 
 
 def parse_chat(project: Project, text: str) -> ChatOutput:
@@ -91,8 +96,9 @@ def parse_chat(project: Project, text: str) -> ChatOutput:
         if kind == "file":
             message.append(take_file(path, "\n".join(body)))
         else:
-            out.acceptance_cmd = "\n".join(body).strip()
-            message.append(f"[acceptance command: {out.acceptance_cmd}]")
+            # Commands are the Tester's job; the planner only describes criteria.
+            out.rejected.append("an acceptance command")
+            message.append("[rejected: acceptance command]")
         block = None
         body.clear()
 
@@ -128,8 +134,8 @@ def parse_chat(project: Project, text: str) -> ChatOutput:
     return out
 
 
-# What `.foreman/Dockerfile` builds on (docker/executor-base/Dockerfile), so the
-# planner does not have to guess.
+# What `.foreman/Dockerfile` builds on (docker/executor-base/Dockerfile). The Builder
+# writes that file in the setup task; this tells it what is already there.
 BASE_IMAGE = (
     "`foreman/executor-base` is Ubuntu 24.04 with git, curl, bash and the coding agent, and "
     "no language runtimes (no Node, no Python): the Dockerfile must install what the project "
@@ -137,170 +143,155 @@ BASE_IMAGE = (
     "back to `USER agent` at the end."
 )
 
+PLAIN_LANGUAGE = (
+    "Think and write in plain language about what the software must do and how it is "
+    "organised. Never write code, tests, file names or paths, shell commands or "
+    "configuration: the Tester and Builder agents do that later, from your documents."
+)
 
-def chat_stage(docs: dict[str, str], tree: list[str]) -> str:
-    """Where the conversation is: "design" until spec, plan and validation exist,
-    "tests" until acceptance tests exist, then "review"."""
-    if not all(docs.get(n, "").strip() for n in ("spec", "plan", "validation")):
+
+def chat_stage(docs: dict[str, str]) -> str:
+    """ "design" until the three planning documents exist, then "review"."""
+    if not all(docs.get(n, "").strip() for n in roles.PLANNING_DOCS):
         return "design"
-    if not any(f.startswith("tests/acceptance/") for f in tree):
-        return "tests"
     return "review"
 
 
 _STAGE_GUIDANCE = {
     "design": [
         "Current step: DESIGN. Ask clarifying questions until the request is clear, then "
-        "write spec.md, plan.md and validation.md. Do not write acceptance tests, the "
-        "Dockerfile or the acceptance command yet: the user reviews the design first. End by "
-        "asking the user to review it.",
-    ],
-    "tests": [
-        "Current step: DESIGN REVIEW. The design documents exist. While the user gives "
-        "feedback, revise them. Once the user says the design is right (or asks you to "
-        "continue), write the acceptance tests, .foreman/Dockerfile and the acceptance command.",
+        "write all three documents. End by asking the user to review them.",
     ],
     "review": [
-        "Current step: REVIEW. Documents and acceptance tests exist. Change them as the user "
-        "asks, keeping spec, validation and tests consistent with each other.",
+        "Current step: REVIEW. The documents exist. Revise them as the user asks, keeping "
+        "requirements, design and acceptance criteria consistent with each other. When the "
+        "user is happy, they approve them and the work is broken into tasks.",
     ],
 }
 
 
-def chat_system_prompt(
-    project: Project, docs: dict[str, str], tree: list[str], acceptance_cmd: str
-) -> str:
-    d = f"specs/{project.feature}"
-    stage = chat_stage(docs, tree)
+def chat_system_prompt(project: Project, docs: dict[str, str], tree: list[str]) -> str:
+    """The Project Planning Agent's instructions and the documents as they are now."""
+    paths = {k: doc_path(project, k) for k in roles.PLANNING_DOCS}
+    stage = chat_stage(docs)
     parts = [
-        "You are the planner for a software project. You design it with the user; coding "
-        "agents implement it later, in small tasks. The deliverables, in order:",
-        f"1. {d}/spec.md - requirements. Give every requirement a stable id on its own bullet, "
-        "e.g. `- FR-1.1 Users can add a todo.` (functional) or `- NFR-1 ...` (non-functional).",
-        f"2. {d}/plan.md - architecture, components, file layout, the interfaces between "
-        "components (names, signatures, data shapes), milestones.",
-        f"3. {d}/validation.md - acceptance criteria, each citing the requirement ids it checks.",
-        "4. Executable acceptance tests under tests/acceptance/ that fail until the software "
-        "is built, plus the command that runs them, and .foreman/Dockerfile.",
+        "You are the Project Planning Agent. You work out a software project with the user "
+        "and write its planning documents, which everyone on the team reads.",
+        PLAIN_LANGUAGE,
         "",
-        "You design; you do not implement. The documents describe behaviour and interfaces "
-        "and contain no implementation code. The only code you write is the acceptance tests "
-        "and the Dockerfile.",
-        "Keep documents concise: the work will be split into small tasks for coding agents "
-        "with small context windows, so prefer small files and clear interfaces.",
-        "Think about decisions, not text: do not draft file contents while reasoning. Write "
-        "each file once, in your reply.",
+        "The documents (markdown, concise, readable by anyone):",
+        f"1. {paths['requirements']} - what the software must do. Give every requirement a "
+        "stable id on its own bullet, e.g. `- FR-1.1 Users can add a todo.` (functional) or "
+        "`- NFR-1 Pages load within a second.` (non-functional).",
+        f"2. {paths['design']} - how it is organised: the main parts, what each is responsible "
+        "for, how they work together, the information they keep, and the important decisions "
+        "with their reasons. Describe, don't implement.",
+        f"3. {paths['acceptance']} - how we will know it is done: concrete, checkable "
+        "statements, each citing the requirement ids it checks, e.g. "
+        "`- AC-1 (FR-1.1) After adding a todo it appears in the list.`",
+        "",
+        "Ask clarifying questions when the request is ambiguous. If you have web search "
+        "tools, use them to research topics you don't know well before deciding; mention "
+        "what you relied on. Keep each document short: the work will be broken into small "
+        "tasks.",
+        "Think about decisions, not text: do not draft the documents while reasoning. Write "
+        "each one once, in your reply.",
         "",
         *_STAGE_GUIDANCE[stage],
         "",
-        "To create or replace a file, output a block with the COMPLETE new content:",
-        "<<<FILE path/to/file",
-        "...complete file content...",
+        "To create or replace a document, output a block with its COMPLETE new content:",
+        "<<<FILE path/of/document.md",
+        "...complete document...",
         ">>>",
-        f"You may only write {d}/spec.md, {d}/plan.md, {d}/validation.md, files under "
-        "tests/acceptance/, and .foreman/Dockerfile (a Dockerfile `FROM foreman/executor-base` "
-        "that installs the language toolchain the project needs).",
-        BASE_IMAGE,
-        "To set the command that runs the acceptance tests:",
-        "<<<ACCEPTANCE_CMD",
-        "the command",
-        ">>>",
+        f"You may only write {', '.join(paths.values())}. Anything else is refused.",
         "Outside those blocks, reply to the user briefly: what you changed and what you need "
         "from them next.",
         "",
-        "# Current state",
-        f"Acceptance command: {acceptance_cmd or '(not set)'}",
+        "# Current documents",
     ]
-    for name in ("spec", "plan", "validation"):
-        content = docs.get(name, "").strip()
-        parts += ["", f"## {d}/{name}.md", content or "(empty)"]
-    parts += ["", "## Repository files", *(tree[:300] or ["(empty repository)"])]
-    if len(tree) > 300:
-        parts.append(f"... and {len(tree) - 300} more")
+    for key, path in paths.items():
+        parts += ["", f"## {path}", docs.get(key, "").strip() or "(empty)"]
+    if tree:
+        parts += ["", "## The repository already contains (for context only)", *tree[:100]]
+        if len(tree) > 100:
+            parts.append(f"... and {len(tree) - 100} more")
     return "\n".join(parts)
 
 
-# -- decomposition ---------------------------------------------------------------
+# -- task planning ---------------------------------------------------------------
 
-TASK_FIELDS = (
-    "key",
-    "title",
-    "description",
-    "req_refs",
-    "todos",
-    "allowed_files",
-    "context_files",
-    "validation_cmd",
-    "deps",
+MAX_CRITERIA = 6
+SIZES = ("small", "medium")
+# Fields that would make the Task Planner think in code: refused.
+CODE_FIELDS = ("allowed_files", "files", "context_files", "validation_cmd", "command", "todos")
+
+STANDARD_TASKS_NOTE = (
+    "Foreman adds three standard tasks itself; do not include them: project setup "
+    "(toolchain, skeleton, test runner, first README and ARCHITECTURE), the acceptance tests, "
+    "and bringing the documentation up to date at the end."
+)
+
+TASK_RULES = [
+    "Each task is done by two agents in turn: a Tester writes tests for it from its "
+    "criteria, then a Builder writes code until those tests pass. They work out the files, "
+    "code and commands; you describe the work.",
+    "Rules for every task:",
+    "- It delivers one small piece of behaviour that can be tested on its own.",
+    "- goal: one or two plain sentences on what it achieves.",
+    f"- criteria: 1-{MAX_CRITERIA} checkable statements in plain language; together they "
+    "say when the task is done (these become its tests).",
+    "- req_refs: the requirement ids it implements.",
+    "- deps: keys of tasks that must finish first. No cycles.",
+    '- size: "small" or "medium". Anything bigger must be split into more tasks.',
+    "- No file names, paths, code or commands anywhere.",
+]
+
+TASK_EXAMPLE = (
+    '[{"key": "T1", "title": "Add a todo", "goal": "Users can add a todo with a title.", '
+    '"req_refs": ["FR-1.1"], "criteria": ["A new todo appears in the list", '
+    '"An empty title is refused with a message"], "deps": [], "size": "small"}]'
 )
 
 
-def decompose_system_prompt(
-    project: Project, docs: dict[str, str], tree: list[str], budget_tokens: int
-) -> str:
-    d = f"specs/{project.feature}"
+def _docs_section(project: Project, docs: dict[str, str]) -> list[str]:
+    out: list[str] = []
+    for key in roles.PLANNING_DOCS:
+        out += ["", f"## {doc_path(project, key)}", docs.get(key, "").strip() or "(empty)"]
+    return out
+
+
+def decompose_system_prompt(project: Project, docs: dict[str, str]) -> str:
+    """The Task Planning Agent breaks the approved documents into tasks."""
     return "\n".join(
         [
-            "You are the planner for a software project. Break the approved plan into small, "
-            "ordered tasks for coding agents that run on local models with small context windows.",
+            "You are the Task Planning Agent. Read the approved planning documents and break "
+            "the project into small, ordered tasks.",
+            PLAIN_LANGUAGE,
             "",
-            "Rules for every task:",
-            f"- It changes at most {project.max_task_files} files, listed explicitly in "
-            "allowed_files (no wildcards). Tests it writes count.",
-            f"- Its context (requirements, file contents, interfaces) must fit in about "
-            f"{budget_tokens} tokens: keep files small; split large changes.",
-            "- validation_cmd is a command that exits 0 only when the task is done, normally a "
-            "targeted test the task itself writes or that already exists.",
-            "- req_refs lists the requirement ids from spec.md it implements.",
-            "- context_files lists existing or earlier-task files whose interfaces it needs "
-            "(read-only).",
-            "- deps lists keys of tasks that must finish first. No cycles.",
-            "- The acceptance tests in tests/acceptance/ must pass once all tasks are done.",
+            *TASK_RULES,
+            STANDARD_TASKS_NOTE,
+            "Together, the tasks must make every acceptance criterion true.",
             "",
             "Output ONLY a JSON array, no prose, like:",
-            '[{"key": "T1", "title": "...", "description": "...", "req_refs": ["FR-1.1"], '
-            '"todos": ["..."], "allowed_files": ["src/x.py", "tests/test_x.py"], '
-            '"context_files": [], "validation_cmd": "pytest -q tests/test_x.py", "deps": []}]',
-            "",
-            f"## {d}/spec.md",
-            docs.get("spec", "").strip() or "(empty)",
-            "",
-            f"## {d}/plan.md",
-            docs.get("plan", "").strip() or "(empty)",
-            "",
-            f"## {d}/validation.md",
-            docs.get("validation", "").strip() or "(empty)",
-            "",
-            f"Acceptance command: {project.acceptance_cmd or '(not set)'}",
-            "",
-            "## Repository files",
-            *(tree[:300] or ["(empty repository)"]),
+            TASK_EXAMPLE,
+            *_docs_section(project, docs),
         ]
     )
 
 
 def split_system_prompt(
-    project: Project,
-    docs: dict[str, str],
-    tree: list[str],
-    budget_tokens: int,
-    task: dict[str, Any],
-    failures: list[str],
+    project: Project, docs: dict[str, str], task: dict[str, Any], failures: list[str]
 ) -> str:
-    """Ask the planner to split one task that keeps failing into smaller ones."""
-    d = f"specs/{project.feature}"
+    """Ask the Task Planning Agent to split one task that keeps failing."""
     return "\n".join(
         [
-            "You are the planner for a software project. Split ONE task that coding agents "
-            "keep failing into 2-4 smaller, ordered tasks that together do the same work.",
+            "You are the Task Planning Agent. The agents keep failing ONE task. Split it into "
+            "2-4 smaller, ordered tasks that together achieve the same goal and criteria.",
+            PLAIN_LANGUAGE,
             "",
-            "Rules for every new task:",
-            f"- It changes at most {project.max_task_files} files, listed explicitly in "
-            "allowed_files (no wildcards).",
-            f"- Its context must fit in about {budget_tokens} tokens.",
-            "- validation_cmd exits 0 only when that task is done.",
+            *TASK_RULES,
             "- deps lists keys of the other new tasks that must finish first.",
-            "- Address the failures below: smaller steps, clearer interfaces, earlier tests.",
+            "- Address the failures below: smaller steps, one behaviour at a time.",
             "",
             "Output ONLY a JSON array in the same format as the task below.",
             "",
@@ -309,15 +300,7 @@ def split_system_prompt(
             "",
             "## Why it failed",
             *[f"- {f}" for f in failures],
-            "",
-            f"## {d}/spec.md",
-            docs.get("spec", "").strip() or "(empty)",
-            "",
-            f"## {d}/plan.md",
-            docs.get("plan", "").strip() or "(empty)",
-            "",
-            "## Repository files",
-            *(tree[:300] or ["(empty repository)"]),
+            *_docs_section(project, docs),
         ]
     )
 
@@ -356,18 +339,21 @@ def _str_list(item: dict[str, Any], name: str) -> list[str]:
 class TaskSpec:
     key: str
     title: str
-    description: str
+    goal: str
     req_refs: list[str]
-    todos: list[str]
-    allowed_files: list[str]
-    context_files: list[str]
-    validation_cmd: str
+    criteria: list[str]
     deps: list[str]
+    size: str = "small"
+    kind: str = "feature"  # setup | acceptance | feature | docs
 
 
 def parse_tasks(text: str) -> list[TaskSpec]:
-    """Parse and structurally validate the planner's task list (raises PlanError)."""
-    items = extract_json_array(text)
+    """Parse and validate the Task Planner's task list (raises PlanError)."""
+    return parse_task_items(extract_json_array(text))
+
+
+def parse_task_items(items: list[Any], known: tuple[str, ...] = ()) -> list[TaskSpec]:
+    """Validate task objects. `known` are keys of existing tasks new ones may depend on."""
     tasks: list[TaskSpec] = []
     problems: list[str] = []
     for i, item in enumerate(items):
@@ -375,43 +361,109 @@ def parse_tasks(text: str) -> list[TaskSpec]:
             problems.append(f"item {i} is not an object")
             continue
         key = str(item.get("key") or f"T{i + 1}").strip()
+        code = [f for f in CODE_FIELDS if item.get(f)]
+        if code:
+            problems.append(
+                f"task {key}: don't give {', '.join(code)}; describe the goal and criteria, "
+                "and the Tester and Builder work out files and commands"
+            )
         try:
             t = TaskSpec(
                 key=key,
                 title=str(item.get("title") or "").strip(),
-                description=str(item.get("description") or "").strip(),
+                goal=str(item.get("goal") or item.get("description") or "").strip(),
                 req_refs=_str_list(item, "req_refs"),
-                todos=_str_list(item, "todos"),
-                allowed_files=_str_list(item, "allowed_files"),
-                context_files=_str_list(item, "context_files"),
-                validation_cmd=str(item.get("validation_cmd") or "").strip(),
+                criteria=_str_list(item, "criteria"),
                 deps=_str_list(item, "deps"),
+                size=str(item.get("size") or "small").strip().lower(),
             )
         except PlanError as e:
             problems.append(str(e))
             continue
         if not t.title:
             problems.append(f"task {key}: missing title")
+        if not t.criteria:
+            problems.append(f"task {key}: needs at least one acceptance criterion")
+        elif len(t.criteria) > MAX_CRITERIA:
+            problems.append(
+                f"task {key}: {len(t.criteria)} criteria (limit {MAX_CRITERIA}); split it"
+            )
+        if t.size not in SIZES:
+            problems.append(f"task {key}: size {t.size!r} is too big; split it")
         tasks.append(t)
 
     keys = [t.key for t in tasks]
-    dupes = {k for k in keys if keys.count(k) > 1}
+    dupes = {k for k in keys if keys.count(k) > 1 or k in known or k in STANDARD_KEYS}
     if dupes:
-        problems.append(f"duplicate keys: {', '.join(sorted(dupes))}")
-    known = set(keys)
+        problems.append(f"duplicate or reserved keys: {', '.join(sorted(dupes))}")
+    allowed = set(keys) | set(known)
     for t in tasks:
-        unknown = [d for d in t.deps if d not in known]
+        unknown = [d for d in t.deps if d not in allowed]
         if unknown:
             problems.append(f"task {t.key}: unknown deps {', '.join(unknown)}")
         if t.key in t.deps:
             problems.append(f"task {t.key}: depends on itself")
     if not problems:
-        cycle = find_cycle({t.key: t.deps for t in tasks})
+        cycle = find_cycle({t.key: [d for d in t.deps if d in keys] for t in tasks})
         if cycle:
             problems.append(f"dependency cycle: {' -> '.join(cycle)}")
     if problems:
         raise PlanError("; ".join(problems))
     return tasks
+
+
+# -- standard tasks -------------------------------------------------------------
+
+SETUP, ACCEPTANCE, DOCS = "SETUP", "ACCEPT", "DOCS"
+STANDARD_KEYS = (SETUP, ACCEPTANCE, DOCS)
+
+
+def standard_tasks(features: list[TaskSpec]) -> list[TaskSpec]:
+    """The plan as it runs: setup first, the acceptance tests, the Task Planner's tasks,
+    and the documentation last."""
+    setup = TaskSpec(
+        key=SETUP,
+        title="Project setup",
+        goal="Prepare the project so every later task can be built and tested: the "
+        "toolchain, the project skeleton, the test runner, and a first README.md and "
+        "ARCHITECTURE.md based on the design.",
+        req_refs=[],
+        criteria=[
+            "The test runner runs the whole test suite and reports results and coverage",
+            "README.md explains what the project is, how to run it and how to test it",
+            "ARCHITECTURE.md explains how the project is organised, following the design",
+        ],
+        deps=[],
+        kind="setup",
+    )
+    acceptance = TaskSpec(
+        key=ACCEPTANCE,
+        title="Acceptance tests",
+        goal="Turn the acceptance criteria into executable acceptance tests: the "
+        "project's definition of done. They fail until the work is finished.",
+        req_refs=[],
+        criteria=["Every acceptance criterion is checked by at least one acceptance test"],
+        deps=[SETUP],
+        kind="acceptance",
+    )
+    planned = [
+        TaskSpec(**{**t.__dict__, "deps": t.deps or [SETUP]})  # everything after setup
+        for t in features
+    ]
+    docs = TaskSpec(
+        key=DOCS,
+        title="Documentation",
+        goal="Bring README.md and ARCHITECTURE.md up to date with what was built.",
+        req_refs=[],
+        criteria=[
+            "README.md says what the project is, how to run it and how to test it, and "
+            "its run and test instructions work",
+            "ARCHITECTURE.md describes how the finished project is organised",
+        ],
+        deps=[ACCEPTANCE, *[t.key for t in planned]],
+        kind="docs",
+    )
+    return [setup, acceptance, *planned, docs]
 
 
 def find_cycle(graph: dict[str, list[str]]) -> list[str]:
@@ -463,7 +515,7 @@ def retry_message(problems: list[str]) -> str:
         "Your task list has problems:\n"
         + "\n".join(f"- {p}" for p in problems)
         + "\nFix them, splitting tasks that are too large, and output the COMPLETE corrected "
-        "JSON array only."
+        "JSON array only (plain language: no files, code or commands)."
     )
 
 
@@ -472,27 +524,27 @@ def render_tasks_md(project: Project, rows: list[dict[str, Any]]) -> str:
     lines = [
         f"# Tasks: {project.name}",
         "",
-        "Generated by foreman from plan.md. Each task is small enough for one agent run.",
+        "Kept by Foreman from the Task Planning Agent's plan. For each task the Tester writes "
+        "tests from its criteria, then the Builder makes them pass.",
         "",
     ]
     for r in rows:
         lines += [f"## {r['key']}: {r['title']}", ""]
-        if r.get("description"):
-            lines += [r["description"], ""]
+        goal = r.get("goal") or r.get("description")
+        if goal:
+            lines += [goal, ""]
+        if r.get("criteria"):
+            lines += ["Done when:", *[f"- {c}" for c in r["criteria"]], ""]
         meta = []
         if r.get("req_refs"):
             meta.append(f"- Requirements: {', '.join(r['req_refs'])}")
         if r.get("deps"):
             meta.append(f"- Depends on: {', '.join(r['deps'])}")
-        meta.append(f"- Files: {', '.join(f'`{f}`' for f in r['allowed_files']) or '(none)'}")
-        if r.get("context_files"):
-            meta.append(f"- Uses: {', '.join(f'`{f}`' for f in r['context_files'])}")
-        meta.append(f"- Done when: `{r['validation_cmd'] or '(missing)'}`")
+        if r.get("kind") and r["kind"] != "feature":
+            meta.append(f"- Kind: {r['kind']}")
         if r.get("state"):
             meta.append(f"- State: {r['state']}")
         lines += meta
-        if r.get("todos"):
-            lines += ["", *[f"- [ ] {t}" for t in r["todos"]]]
         if r.get("violations"):
             lines += ["", f"> Size check: {'; '.join(r['violations'])}"]
         lines.append("")

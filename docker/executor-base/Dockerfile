@@ -9,12 +9,15 @@
 #
 #   docker build -t foreman/executor-base:latest docker/executor-base
 #   docker build --build-arg PI_VERSION=1.4.0 -t foreman/executor-base:latest docker/executor-base
+#   docker build --build-arg WITH_AIDER=1 -t foreman/executor-base:latest docker/executor-base
 
 FROM ubuntu:24.04
 
 ARG OPENCODE_VERSION=1.19.3
 ARG PI_VERSION=1.4.0
 ARG PI_NODE_VERSION=22.23.4
+# Optional extra executor: Aider (adds Python and ~300 MB).
+ARG WITH_AIDER=0
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -52,6 +55,15 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/pi; \
     pi --version; \
     ! command -v node
+
+RUN set -eux; \
+    if [ "$WITH_AIDER" = "1" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends python3 pipx; \
+      PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install aider-chat; \
+      aider --version; \
+      rm -rf /var/lib/apt/lists/* /root/.cache; \
+    fi
 
 # Non-root user the orchestrator runs containers as (uid/gid 1000).
 # ubuntu:24.04 ships an "ubuntu" user with uid 1000; replace it with "agent".
